@@ -1,15 +1,3 @@
-<!--
-  LUCIA — Intelligent Personal AI Companion & Linux Desktop Agent
-  Maintained by: https://github.com/mahadiurrehman-pixel
--->
-
-<div align="center">
-  <a href="https://github.com/mahadiurrehman-pixel">
-    <img src="./assets/lucia-banner.svg" alt="LUCIA — Intelligent Personal AI Companion & Linux Desktop Agent" width="100%" />
-  </a>
-
-  <br />
-  <br />
 
   <p>
     <strong>An intelligent, voice-first personal AI companion built for conversation, memory, automation, and resilient LLM orchestration.</strong>
