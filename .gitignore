@@ -1,0 +1,70 @@
+# ==========================================
+# 🔑 Environment & Secrets (NEVER COMMIT)
+# ==========================================
+.env
+.env.*
+!.env.example
+
+# ==========================================
+# 🗄️ Database & User State
+# ==========================================
+*.db
+*.sqlite
+*.sqlite3
+lucia.db
+contacts.json
+# ==========================================
+# 🐍 Python & Virtual Environments
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+.venv-wake/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# ==========================================
+# 🎙️ Audio Cache & Temporary Files
+# ==========================================
+*.wav
+*.mp3
+*.ogg
+output.wav
+command.wav
+
+# ==========================================
+# 📦 Large Offline Acoustic Models (Download separately)
+# ==========================================
+vosk-model-*/
+*.onnx
+*.onnx.json
+
+# ==========================================
+# 💻 IDE & OS Generated Files
+# ==========================================
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
