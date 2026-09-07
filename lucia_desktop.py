@@ -1,8 +1,8 @@
 """
-LUCIA Desktop Voice Assistant
-- Smooth Full-Sentence Streaming (Natural human cadence)
-- Pure Pakistani Tone & Colloquial Phrases
-- Groq Whisper Turbo + Llama 3.3 70B
+LUCIA Desktop Voice Assistant (Zero-Lag & Instant Speech Generation)
+- Reverted to 100% Accurate Google STT for Roman Urdu
+- Generates speech instantly for the whole response (Removes streaming gaps)
+- Groq Llama 3.3 70B
 """
 import os
 import sys
@@ -12,8 +12,6 @@ import math
 import wave
 import json
 import random
-import queue
-import threading
 from pathlib import Path
 import numpy as np
 from dotenv import load_dotenv
@@ -65,6 +63,7 @@ from lucia_core import (
     summary_model,
     build_chat_context,
     update_conversation_summary,
+    execute_llm_with_retry
 )
 
 # ==========================================
@@ -76,12 +75,11 @@ CHANNELS = 1
 FORMAT = pyaudio.paInt16
 
 SILENCE_THRESHOLD = 320
-SILENCE_DURATION = 0.7
+SILENCE_DURATION = 0.6
 MAX_RECORD_SECONDS = 6.0
 
 STOP_WORDS = ["chup", "stop", "khamosh", "bas", "band", "quiet", "chup ho jao", "band ho jao", "sleep"]
 
-# 🇵🇰 Authentic Pakistani Urdu Greetings & Responses
 WAKE_PHRASES = [
     "Haan bhai, bolo kya scene hai?",
     "Ji janab, hukum karein!",
@@ -94,7 +92,7 @@ WAKE_PHRASES = [
 ]
 
 # ==========================================
-# AUDIO PLAYBACK & STREAMING ENGINE
+# AUDIO PLAYBACK ENGINE
 # ==========================================
 def play_audio_bytes(audio_bytes):
     if not audio_bytes:
@@ -120,66 +118,6 @@ def play_audio_bytes(audio_bytes):
         restore_stderr(saved_err)
     except Exception as e:
         print(f"[Playback Error]: {e}")
-
-
-def stream_tts_and_play(token_generator):
-    """
-    ⚡ Smooth Natural Streaming:
-    Buffers full logical sentences before speaking so neural intonation sounds 100% human!
-    """
-    full_text = ""
-    sentence_buffer = ""
-    sentence_endings = [".", "!", "?", "\n"]
-    
-    audio_queue = queue.Queue()
-    stop_event = threading.Event()
-    
-    def player_worker():
-        while not stop_event.is_set() or not audio_queue.empty():
-            try:
-                audio_bytes = audio_queue.get(timeout=0.1)
-                if audio_bytes:
-                    play_audio_bytes(audio_bytes)
-                audio_queue.task_done()
-            except queue.Empty:
-                continue
-
-    player_thread = threading.Thread(target=player_worker, daemon=True)
-    player_thread.start()
-
-    try:
-        for chunk in token_generator:
-            content = chunk.content if hasattr(chunk, "content") else str(chunk)
-            if content:
-                full_text += content
-                sentence_buffer += content
-                
-                sys.stdout.write(content)
-                sys.stdout.flush()
-                
-                # Check for a complete sentence
-                has_ending = any(d in sentence_buffer for d in sentence_endings)
-                if has_ending and len(sentence_buffer.strip()) >= 15:
-                    clean_chunk = sentence_buffer.strip()
-                    audio = synthesize_google_tts(clean_chunk)
-                    if audio:
-                        audio_queue.put(audio)
-                    sentence_buffer = ""
-
-        # Process any remaining text
-        if sentence_buffer.strip():
-            clean_chunk = sentence_buffer.strip()
-            if len(clean_chunk) > 2:
-                audio = synthesize_google_tts(clean_chunk)
-                if audio:
-                    audio_queue.put(audio)
-
-    finally:
-        stop_event.set()
-        player_thread.join()
-
-    print()
-    return full_text
 
 
 def get_desktop_conversation_id():
@@ -238,7 +176,7 @@ def record_command(stream):
 # ==========================================
 def main():
     print("\n" + "="*55)
-    print("🤖 LUCIA DESKTOP BRAIN & VOICE DAEMON (NATURAL VOICE)")
+    print("🤖 LUCIA DESKTOP BRAIN & VOICE DAEMON (ZERO-LAG)")
     print("="*55)
     
     conv_id = get_desktop_conversation_id()
@@ -323,7 +261,7 @@ def main():
                     tool_result = None
                     action_done = False
                     
-                    if decision.get("action") == "tool":
+                    if decision.get("action") in ["tool", "tool_sequence"] or "tools" in decision:
                         print(f"⚙️ Executing Tool: {decision.get('tool')}")
                         tool_result = execute_tool(decision)
                         
@@ -336,7 +274,7 @@ def main():
                             action_done = True
                     
                     if not action_done:
-                        print("🤖 LUCIA (Streaming): ", end="", flush=True)
+                        print("🧠 LUCIA is thinking...")
                         
                         recent = get_recent_messages(conv_id, limit=6)
                         recent_msgs = []
@@ -346,21 +284,23 @@ def main():
                             elif r == "assistant":
                                 recent_msgs.append(AIMessage(content=c))
                         
-                        context = build_chat_context(conv_id, recent_msgs)
+                        context = build_chat_context(conv_id, recent_msgs, tool_result=tool_result, decision=decision)
                         
-                        if tool_result and decision.get("tool") == "web_search":
-                            tool_context = f"""
-                            User ne question pucha tha. Fresh Web results:
-                            {tool_result['message']}
-                            Synthesize search with internal knowledge. Answer in 2 short, crisp conversational Roman Urdu sentences.
-                            """
-                            context.append(SystemMessage(content=tool_context))
-                        
-                        token_stream = model.stream(context)
-                        reply_text = stream_tts_and_play(token_stream)
-                        
-                        save_message(conv_id, "assistant", reply_text)
-                        update_conversation_summary(conv_id)
+                        try:
+                            # ⚡ Snappy execution with Llama 3.3's instant generation (<0.3s)
+                            response = execute_llm_with_retry(model.invoke, context)
+                            reply_text = response.content.strip()
+                            
+                            print(f"🤖 LUCIA: \"{reply_text}\"")
+                            save_message(conv_id, "assistant", reply_text)
+                            update_conversation_summary(conv_id)
+                            
+                            # Synthesize and play at once
+                            tts_bytes = synthesize_google_tts(reply_text)
+                            play_audio_bytes(tts_bytes)
+                        except Exception as err:
+                            print(f"[Groq Error]: {err}")
+                            play_audio_bytes(synthesize_google_tts("Server par load hai bhai, dobara bolein."))
                     
                     recognizer.Reset()
                     print("\n🟢 Back to Listening for 'LUCIA'...\n" + "─"*55)

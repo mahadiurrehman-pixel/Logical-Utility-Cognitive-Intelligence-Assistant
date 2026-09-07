@@ -1,13 +1,13 @@
 """
 LUCIA's Messaging & Social Tools
-- Safe messaging drafts
-- Direct WhatsApp & Instagram searching
+- Desktop-safe asynchronous browser launch
+- Instant WhatsApp & Instagram messaging and search
 """
 import json
 import os
 import uuid
-import webbrowser
 import urllib.parse
+from tools.browser_tools import launch_browser_async
 
 CONTACTS_FILE = "contacts.json"
 
@@ -55,58 +55,44 @@ def find_contact(platform: str, name: str):
 
 
 # ==========================================
-# 🔍 SEARCH INSTAGRAM
+# 🔍 SEARCH INSTAGRAM (Background Safe)
 # ==========================================
 def search_instagram(query: str) -> dict:
-    """
-    Searches Instagram for users, hashtags, or topic keywords.
-    """
     try:
         clean_query = query.strip()
         
-        # 1. Profile Search (e.g. "@cristiano" or "profile cristiano")
         if clean_query.startswith("@"):
             username = clean_query[1:].strip()
             url = f"https://www.instagram.com/{username}/"
             msg = f"Instagram par '@{username}' ki profile khol di."
-            
-        # 2. Hashtag Search (e.g. "#generativeai")
         elif clean_query.startswith("#"):
             tag = clean_query[1:].strip()
             url = f"https://www.instagram.com/explore/tags/{urllib.parse.quote(tag)}/"
             msg = f"Instagram par hashtag '#{tag}' search kar diya."
-            
-        # 3. Check if it's a known contact username
         else:
             saved_username = find_contact("instagram", clean_query)
             if saved_username:
                 url = f"https://www.instagram.com/{saved_username}/"
                 msg = f"Instagram par {clean_query} (@{saved_username}) ki profile khol di."
             else:
-                # General Keyword Search
                 encoded = urllib.parse.quote(clean_query)
                 url = f"https://www.instagram.com/explore/search/keyword/?q={encoded}"
                 msg = f"Instagram par '{clean_query}' search kar diya."
                 
-        webbrowser.open(url)
+        launch_browser_async(url)
         return {"success": True, "message": msg}
     except Exception as e:
         return {"success": False, "message": f"Instagram search nahi ho saki: {e}"}
 
 
 # ==========================================
-# 🔍 SEARCH WHATSAPP
+# 🔍 SEARCH WHATSAPP (Background Safe)
 # ==========================================
 def search_whatsapp(query: str) -> dict:
-    """
-    Searches WhatsApp: If contact exists, opens direct chat.
-    Otherwise opens WhatsApp Web and copies search term to clipboard.
-    """
     try:
         clean_query = query.strip()
         contact_id = find_contact("whatsapp", clean_query)
         
-        # If matching contact found in contacts.json -> Open Chat Directly
         if contact_id:
             clean_phone = str(contact_id).replace(" ", "").replace("-", "")
             if not clean_phone.startswith("+"):
@@ -116,14 +102,13 @@ def search_whatsapp(query: str) -> dict:
                     clean_phone = "+92" + clean_phone
                     
             url = f"https://web.whatsapp.com/send?phone={clean_phone}"
-            webbrowser.open(url)
+            launch_browser_async(url)
             return {
                 "success": True, 
                 "message": f"WhatsApp par {clean_query} ({clean_phone}) ki chat khol di."
             }
         
-        # If not a saved contact, open WhatsApp Web
-        webbrowser.open("https://web.whatsapp.com")
+        launch_browser_async("https://web.whatsapp.com")
         hint = ""
         try:
             import pyperclip
@@ -141,7 +126,7 @@ def search_whatsapp(query: str) -> dict:
 
 
 # ==========================================
-# 📩 DRAFT & SEND MESSAGES
+# 📩 DRAFT & SEND MESSAGES (Background Safe)
 # ==========================================
 def draft_message(platform: str, contact: str, message: str) -> dict:
     platform = platform.lower().strip()
@@ -160,20 +145,9 @@ def draft_message(platform: str, contact: str, message: str) -> dict:
     
     contact_id = find_contact(platform, contact)
     
+    # If contact not found, we use contact name as fallback ID directly to avoid deadends
     if not contact_id:
-        return {
-            "success": True,
-            "needs_clarification": True,
-            "message": f"'{contact}' contact list mein nahi mila.",
-            "draft": {
-                "id": str(uuid.uuid4())[:8],
-                "platform": platform,
-                "contact_name": contact,
-                "contact_id": contact,
-                "message": message.strip(),
-                "status": "needs_contact"
-            }
-        }
+        contact_id = contact
     
     draft = {
         "id": str(uuid.uuid4())[:8],
@@ -192,8 +166,17 @@ def draft_message(platform: str, contact: str, message: str) -> dict:
 
 
 def send_whatsapp_message(phone: str, message: str) -> dict:
+    """⚡ Standardized Background Safe WhatsApp Redirect Launcher"""
     try:
         clean_phone = str(phone).replace(" ", "").replace("-", "")
+        # If it's a name (not a number) because contact wasn't saved, we search WhatsApp instead
+        if not any(char.isdigit() for char in clean_phone):
+            launch_browser_async("https://web.whatsapp.com")
+            return {
+                "success": True,
+                "message": f"WhatsApp Web khol diya hai taake aap {phone} ko search karke message paste kar sakein."
+            }
+
         if not clean_phone.startswith("+"):
             if clean_phone.startswith("0"):
                 clean_phone = "+92" + clean_phone[1:]
@@ -202,29 +185,36 @@ def send_whatsapp_message(phone: str, message: str) -> dict:
 
         encoded_message = urllib.parse.quote(message)
         url = f"https://web.whatsapp.com/send?phone={clean_phone}&text={encoded_message}"
-        webbrowser.open(url)
+        
+        # ⚡ Safe Async Desktop Pop-up
+        launch_browser_async(url)
         return {
             "success": True, 
-            "message": f"WhatsApp Web par message pre-fill kar diya hai. Enter dabate hi send ho jayega!"
+            "message": f"WhatsApp Web par {phone} ka chat khol diya hai. Bas send click kar dein!"
         }
     except Exception as e:
         return {"success": False, "message": f"WhatsApp error: {e}"}
 
 
 def send_instagram_message(username: str, message: str) -> dict:
+    """⚡ Standardized Background Safe Instagram Redirect Launcher"""
     try:
-        url = f"https://www.instagram.com/direct/inbox/"
-        webbrowser.open(url)
+        clean_user = str(username).replace("@", "").strip()
+        
+        # Open user direct profile safely
+        url = f"https://www.instagram.com/{clean_user}/"
+        launch_browser_async(url)
+        
         try:
             import pyperclip
             pyperclip.copy(message)
-            note = "Message copy ho chuka hai, bas DM mein paste karein."
+            note = "Message copy ho chuka hai, profile open hote hi DM mein paste (Ctrl+V) kar dein!"
         except Exception:
             note = f"Message: '{message}'"
 
         return {
             "success": True, 
-            "message": f"Instagram Direct khol diya hai. {note}"
+            "message": f"Instagram par {username} ki profile open kar di hai. {note}"
         }
     except Exception as e:
         return {"success": False, "message": f"Instagram error: {e}"}

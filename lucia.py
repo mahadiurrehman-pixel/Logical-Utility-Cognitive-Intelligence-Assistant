@@ -16,10 +16,9 @@ from database import (
     get_all_memories,
     get_global_memories,
 )
-import time
 from audio_engine import transcribe_audio, synthesize_google_tts
 
-# 🧠 Core Import
+# Core Import
 from lucia_core import (
     model,
     summary_model,
@@ -56,40 +55,20 @@ def load_conversation(conversation_id):
 
 def stream_response(context):
     try:
-        start_time = time.time()
-        first_token = True
-
         for chunk in model.stream(context):
             content = chunk.content
-
             if content:
                 if isinstance(content, list):
                     for item in content:
                         if isinstance(item, dict) and "text" in item:
-                            text = str(item["text"])
-                            if first_token:
-                                print(f"⚡ First token: {time.time() - start_time:.2f}s")
-                                first_token = False
-                            yield text
-
+                            yield str(item["text"])
                         elif isinstance(item, str):
-                            if first_token:
-                                print(f"⚡ First token: {time.time() - start_time:.2f}s")
-                                first_token = False
                             yield item
                 else:
-                    text = str(content)
-
-                    if first_token:
-                        print(f"⚡ First token: {time.time() - start_time:.2f}s")
-                        first_token = False
-
-                    yield text
-
-        print(f"✅ Total generation: {time.time() - start_time:.2f}s")
-
+                    yield str(content)
     except Exception as e:
         st.error(f"⚠️ API Notice: {e}")
+
 
 # State Init
 if "current_conversation_id" not in st.session_state:
@@ -160,6 +139,7 @@ with st.sidebar:
 st.title("LUCIA")
 st.caption("Your intelligent work companion")
 
+# Display Chat History
 for idx, message in enumerate(st.session_state.messages):
     if isinstance(message, HumanMessage):
         with st.chat_message("user"):
@@ -180,20 +160,26 @@ for idx, message in enumerate(st.session_state.messages):
                     st.rerun()
 
 
-# DRAFT UI
+# ==========================================
+# 📩 UNIFIED MESSAGE & EMAIL DRAFT UI
+# ==========================================
 if st.session_state.pending_draft:
     draft = st.session_state.pending_draft
+    is_gmail = (draft.get("platform") == "gmail")
     
     with st.chat_message("assistant"):
-        st.markdown("### 📩 Message Draft")
+        st.markdown(f"### 📩 { 'Email Draft' if is_gmail else 'Message Draft' }")
         col_a, col_b = st.columns(2)
         with col_a:
             st.markdown(f"**Platform:** `{draft['platform'].title()}`")
         with col_b:
-            st.markdown(f"**To:** `{draft['contact_name'].title()}`")
+            st.markdown(f"**To:** `{draft['contact_name'].title() if is_gmail else draft['contact_name'].title()}`")
+            
+        if is_gmail:
+            st.markdown(f"**Subject:** `{draft['subject']}`")
         
         edited_msg = st.text_area(
-            "**Message:**", 
+            "**Message Body:**", 
             value=draft['message'], 
             key=f"edit_{draft['id']}",
             height=100
@@ -204,8 +190,18 @@ if st.session_state.pending_draft:
         with col1:
             if st.button("✅ Send", key=f"send_{draft['id']}", use_container_width=True, type="primary"):
                 draft['message'] = edited_msg
-                with st.spinner("📤 Bhej rahi hoon..."):
-                    result = confirm_and_send(draft)
+                with st.spinner("📤 Sending..."):
+                    if is_gmail:
+                        from tools.gmail_tools import send_email
+                        result = send_email(
+                            to=draft.get("to") or draft.get("contact_id"),
+                            subject=draft.get("subject"),
+                            body=draft['message'],
+                            cc=draft.get("cc", ""),
+                            confirm=True
+                        )
+                    else:
+                        result = confirm_and_send(draft)
                 
                 confirmation = f"{'✅' if result['success'] else '❌'} {result['message']}"
                 st.session_state.messages.append(AIMessage(content=confirmation))
@@ -223,7 +219,7 @@ if st.session_state.pending_draft:
         with col3:
             if st.button("❌ Cancel", key=f"cancel_{draft['id']}", use_container_width=True):
                 st.session_state.pending_draft = None
-                cancellation = "❌ Message cancel kar diya."
+                cancellation = "❌ Email draft cancel kar diya." if is_gmail else "❌ Message cancel kar diya."
                 st.session_state.messages.append(AIMessage(content=cancellation))
                 save_message(st.session_state.current_conversation_id, "assistant", cancellation)
                 st.rerun()
@@ -232,21 +228,22 @@ if st.session_state.pending_draft:
 # REGENERATE FLOW
 if st.session_state.regenerate_flag:
     st.session_state.regenerate_flag = False
-    context = build_chat_context(st.session_state.current_conversation_id, st.session_state.messages[-10:])
+    context = build_chat_context(st.session_state.current_conversation_id, st.session_state.messages[-6:])
     
     with st.chat_message("assistant"):
         try:
             raw_res = st.write_stream(stream_response(context))
             response_text = str(raw_res) if raw_res is not None else ""
             
-            if enable_voice_out:
-                with st.spinner("🔊 Generating voice..."):
-                    audio_bytes = synthesize_google_tts(response_text)
-                    st.session_state.current_audio = audio_bytes
-            
-            st.session_state.messages.append(AIMessage(content=response_text))
-            save_message(st.session_state.current_conversation_id, "assistant", response_text)
-            update_conversation_summary(st.session_state.current_conversation_id)
+            if response_text.strip():
+                if enable_voice_out:
+                    with st.spinner("🔊 Generating voice..."):
+                        audio_bytes = synthesize_google_tts(response_text)
+                        st.session_state.current_audio = audio_bytes
+                
+                st.session_state.messages.append(AIMessage(content=response_text))
+                save_message(st.session_state.current_conversation_id, "assistant", response_text)
+                update_conversation_summary(st.session_state.current_conversation_id)
         except Exception:
             st.error("⚠️ Server busy. Please try again.")
     st.rerun()
@@ -289,47 +286,52 @@ if prompt:
         decision = {"action": "chat"}
     
     tool_result = None
-    if decision.get("action") == "tool":
+    is_tool_action = decision.get("action") in ["tool", "tool_sequence"] or "tools" in decision or "tool" in decision
+    
+    if is_tool_action and decision.get("action") != "chat":
         with st.spinner(f"⚙️ Kaam kar rahi hoon..."):
             tool_result = execute_tool(decision)
         
-        if decision.get("tool") == "draft_message" and tool_result.get("draft"):
+        # ⚡ Handle clarification requests (missing email fields)
+        if tool_result.get("needs_clarification"):
+            # Don't show draft card, let LLM ask naturally
+            pass
+        
+        # Save draft to session for Card Rendering (only if complete)
+        elif tool_result.get("draft"):
             st.session_state.pending_draft = tool_result["draft"]
+            
+            # Show auto-fill notification
+            auto_info = tool_result.get("auto_filled", {})
+            if auto_info.get("signature_added"):
+                st.info(f"✍️ Auto-signed as: **{auto_info.get('name', 'User')}**")
         
         if decision.get("tool") == "generate_code_file" and tool_result.get("data"):
             with st.chat_message("assistant"):
-                st.code(tool_result["data"], language=decision["params"].get("language", "python"))
+                st.code(tool_result["data"], language="python")
 
-    context = build_chat_context(conv_id, st.session_state.messages[-10:])
-    if tool_result:
-        tool_name = decision.get("tool")
-        if tool_name == "web_search":
-            tool_context = f"""
-            User ne search/question pucha tha. Fresh Web results:
-            {tool_result['message']}
-            Synthesize search with internal knowledge. Answer in friendly Roman Urdu.
-            """
-        else:
-            tool_context = f"""
-            Tool result: {tool_result['message']}
-            Success: {tool_result['success']}
-            Give a short, friendly 1-sentence Roman Urdu confirmation (e.g. 'Done bhai, YouTube khol diya hai').
-            """
-        context.append(SystemMessage(content=tool_context))
+    # Build context with tool result injected
+    context = build_chat_context(
+        conv_id, 
+        st.session_state.messages[-6:], 
+        tool_result=tool_result, 
+        decision=decision
+    )
 
     with st.chat_message("assistant"):
         try:
             raw_res = st.write_stream(stream_response(context))
             response_text = str(raw_res) if raw_res is not None else ""
             
-            if enable_voice_out:
-                with st.spinner("🔊 Generating voice..."):
-                    audio_bytes = synthesize_google_tts(response_text)
-                    st.session_state.current_audio = audio_bytes
+            if response_text.strip():
+                if enable_voice_out:
+                    with st.spinner("🔊 Generating voice..."):
+                        audio_bytes = synthesize_google_tts(response_text)
+                        st.session_state.current_audio = audio_bytes
 
-            st.session_state.messages.append(AIMessage(content=response_text))
-            save_message(conv_id, "assistant", response_text)
-            update_conversation_summary(conv_id)
+                st.session_state.messages.append(AIMessage(content=response_text))
+                save_message(conv_id, "assistant", response_text)
+                update_conversation_summary(conv_id)
             
         except Exception as e:
             st.error(f"⚠️ Error: {e}")

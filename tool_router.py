@@ -1,6 +1,6 @@
 """
 Tool Router: LUCIA ka decision brain
-Optimized with local heuristic pre-routing to prevent unnecessary LLM calls.
+Optimized with Global Profile memories to auto-fill personalized professional email drafts.
 """
 import json
 import re
@@ -9,10 +9,16 @@ from tools import (
     open_website, open_google, open_youtube,
     search_youtube, play_youtube,
     web_search,
-    list_files, read_file, write_file, create_folder, open_file, delete_file_safe,
+    list_directory, read_file, write_file, create_file,
+    edit_file, delete_file, create_directory, open_file,
     generate_code_file,
     draft_message,
-    search_instagram, search_whatsapp
+    search_instagram, search_whatsapp,
+    execute_command,
+    authenticate_gmail, fetch_unread_emails,
+    summarize_emails, read_email, search_emails,
+    prepare_email, send_email, create_draft, reply_email,
+    confirm_last_email, cancel_last_email,
 )
 
 # Available tools schema
@@ -24,16 +30,23 @@ Available tools you can use:
 3. open_youtube() - Opens YouTube homepage
 4. search_youtube(query) - Opens YouTube search results list
 5. play_youtube(query) - DIRECTLY PLAYS top video/song on YouTube
-6. web_search(query) - Search web for live information, definitions, facts, weather, or real-time questions
-7. list_files(folder) - List files in folder
+6. web_search(query) - Search web for live information
+7. list_directory(path) - List files in folder
 8. read_file(path) - Read file contents
 9. write_file(path, content) - Create/write a file
-10. create_folder(path) - Create folder
-11. open_file(path) - Open local file in default OS app
-12. generate_code_file(path, code, language) - Save generated code to file
-13. draft_message(platform, contact, message) - Prepare WhatsApp/Instagram draft
-14. search_instagram(query) - Search on Instagram
-15. search_whatsapp(query) - Search WhatsApp for a contact/chat
+10. create_directory(path) - Create folder
+11. execute_command(command, cwd) - Run local shell command safely
+
+GMAIL:
+12. authenticate_gmail() - Connect/test Gmail
+13. fetch_unread_emails(max_results) - Get unread emails
+14. summarize_emails(max_results) - AI summary + urgent detection
+15. read_email(email_id) - Read specific email
+16. search_emails(query, max_results) - Search emails
+17. prepare_email(to, subject, body, cc) - Prepare email and generate a draft review card (DOES NOT SEND)
+18. confirm_last_email() - Send the last prepared email (Call when user says "haan bhej do", "send it", "bhej do")
+19. cancel_last_email() - Cancel/discard the last prepared email (Call when user says "cancel", "cancel karo", "mat bhejo")
+20. draft_message(platform, contact, message) - Prepare WhatsApp/Instagram message draft
 """
 
 TOOL_MAP = {
@@ -43,80 +56,80 @@ TOOL_MAP = {
     "search_youtube": search_youtube,
     "play_youtube": play_youtube,
     "web_search": web_search,
-    "list_files": list_files,
+    "list_directory": list_directory,
     "read_file": read_file,
     "write_file": write_file,
-    "create_folder": create_folder,
-    "open_file": open_file,
+    "create_file": create_file,
+    "edit_file": edit_file,
+    "delete_file": delete_file,
+    "create_directory": create_directory,
+    "execute_command": execute_command,
     "generate_code_file": generate_code_file,
     "draft_message": draft_message,
     "search_instagram": search_instagram,
     "search_whatsapp": search_whatsapp,
+    "authenticate_gmail": authenticate_gmail,
+    "fetch_unread_emails": fetch_unread_emails,
+    "summarize_emails": summarize_emails,
+    "read_email": read_email,
+    "search_emails": search_emails,
+    "prepare_email": prepare_email,
+    "send_email": send_email,
+    "create_draft": create_draft,
+    "reply_email": reply_email,
+    "confirm_last_email": confirm_last_email,
+    "cancel_last_email": cancel_last_email,
 }
-
-
-def message_might_need_tool(user_msg: str) -> bool:
-    """
-    Highly-optimized Heuristic fast-path check.
-    Returns True if user's input matches potential action triggers.
-    Filters out basic greetings, direct queries without action intent, and casual talk locally.
-    """
-    msg = user_msg.lower().strip()
-    
-    # Tool action keywords
-    action_keywords = [
-        "kholo", "open", "go to", "website", ".com", ".org", ".net", ".ai", "visit", # Browser
-        "search", "google", "dhoondo", "fetch", "find", "pata karo", "what is", "who is", "latest", "news", "weather", "gold rate", # Search / RAG
-        "youtube", "play", "chalao", "lagao", "sunao", "video", # YouTube
-        "folder", "directory", "file", "create", "write", "banao", "likho", "read", "padho", "delete", "remove", "khatam", # File / Code Operations
-        "message", "whatsapp", "instagram", "dm", "bhejo", "draft" # Messaging
-    ]
-    return any(word in msg for word in action_keywords)
 
 
 def decide_action(user_msg: str, llm) -> dict:
     """
     Ask LLM: Is this a tool call or normal chat?
-    Returns: {"action": "chat" or "tool", "tool": "...", "params": {...}}
+    Injects global user memories to write customized professional emails.
     """
-    # ⚡ Rate limit optimization: Skip LLM call if local heuristics find no tool keywords
-    if not message_might_need_tool(user_msg):
-        return {"action": "chat"}
+    msg_clean = user_msg.lower().strip()
+    
+    # ⚡ Fast Path: Map direct voice confirmation keys instantly
+    if msg_clean in ["haan bhej do", "send kar do", "bhej do", "bhej de", "send it", "yes send it"]:
+        return {"action": "tool", "tool": "confirm_last_email", "params": {}}
+    if msg_clean in ["cancel karo", "cancel", "mat bhejo", "discard", "discard it"]:
+        return {"action": "tool", "tool": "cancel_last_email", "params": {}}
+
+    # 🧠 Load Global Memories to make the Router intelligent about the User
+    from database import get_global_memories
+    mems = get_global_memories()
+    memories_text = "No profile memories found."
+    if mems:
+        memories_text = "\n".join([f"- {m['memory']}" for m in mems])
 
     router_prompt = f"""You are LUCIA's action router. Analyze the user's message and decide:
 
-- If user wants conversation/coding advice ONLY, return: {{"action": "chat"}}
+- If user wants conversation ONLY, return: {{"action": "chat"}}
 - If user wants to PERFORM an action, return the appropriate tool call.
 
 {TOOLS_SCHEMA}
 
-RULES:
-- For factual, live queries, definitions ("What is Python", "Who is Babar Azam", "Google se fetch karo..."): use `web_search`.
-- When user says "search on Instagram" or "Instagram par dhoondo/search karo" or gives a profile/hashtag on IG -> use `search_instagram`
-- When user says "search on WhatsApp" or "WhatsApp par [person] ko dhoondo/search karo" -> use `search_whatsapp`
-- When user says "message bhejo/likho/draft karo" -> use `draft_message`
-- When user says "play" / "chalao" on YouTube -> use `play_youtube`
-- Return valid JSON ONLY.
+=== USER PROFILE MEMORIES ===
+Use these real details about the user to write highly tailored, professional email bodies. 
+Do NOT write generic placeholders like '[My Name]' or '[My University]' in the email body. Replace them with the actual facts below:
+{memories_text}
+
+EMAIL WRITING & CLARIFICATION RULES:
+- When user asks to write/send a professional email (e.g., job application, leave, project update): Use the USER PROFILE MEMORIES to draft a complete, customized, professional email body.
+- If recipient email is not provided, set "to": "" so the tool triggers clarification questions.
+- If user says "bhej do" / "send it" -> use confirm_last_email.
+- Only respond in valid JSON, nothing else.
 
 Examples:
-User: "Instagram par AI Art search karo"
-{{"action": "tool", "tool": "search_instagram", "params": {{"query": "AI Art"}}}}
 
-User: "WhatsApp par Ali ko search karo"
-{{"action": "tool", "tool": "search_whatsapp", "params": {{"query": "Ali"}}}}
-
-User: "Ali ko WhatsApp pe message likho ke kal meeting hai"
-{{"action": "tool", "tool": "draft_message", "params": {{"platform": "whatsapp", "contact": "Ali", "message": "Kal meeting hai."}}}}
-
-User: "YouTube par LoFi music chalao"
-{{"action": "tool", "tool": "play_youtube", "params": {{"query": "LoFi music"}}}}
+User: "hr@techcorp.com ko cloud engineer internship ke liye professional email likho"
+{{"action": "tool", "tool": "prepare_email", "params": {{"to": "hr@techcorp.com", "subject": "Application for Cloud Engineer Internship", "body": "Dear Hiring Manager,\\n\\nI hope this email finds you well.\\n\\nI am writing to express my strong interest in the Cloud Engineer Internship position at TechCorp. Currently, I am pursuing my BBIT at Air University, which has equipped me with a strong foundation in managing IT systems and data architectures.\\n\\nAs a Python developer with a deep passion for cloud systems and automation, I am eager to apply my skills to real-world projects at TechCorp. Thank you for your time and consideration.\\n\\nRegards,\\n[Use User Name from memories]"}}}}
 
 User message: "{user_msg}"
 
 Respond with valid JSON only:"""
 
     try:
-        # LLM Invocation wrapped directly with exception handling in lucia.py
         response = llm.invoke([HumanMessage(content=router_prompt)])
         text = response.content.strip()
         

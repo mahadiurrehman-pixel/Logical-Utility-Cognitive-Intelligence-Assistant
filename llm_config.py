@@ -1,26 +1,17 @@
+
 """
 LUCIA LLM Configuration & Model Registry
 
-Centralized configuration for:
-- Provider credentials
-- Provider priority
-- Model routing
-- Retry policies
-- Cooldown policies
-- Streaming
-- Token tracking
+Provider fallback strategy:
 
-Provider strategy:
+1. Groq Primary
+2. Groq MDI
+3. Groq UNI
+4. Hugging Face
+5. Gemini
 
-1. Hugging Face  -> Primary
-2. Groq          -> First fallback
-3. Gemini        -> Final fallback
-
-IMPORTANT:
-- This file contains configuration only.
-- Provider API calls belong in provider adapters.
-- API keys must never be hardcoded.
-- Free availability and rate limits are controlled by each provider.
+API keys are loaded ONLY from environment variables.
+Never hardcode credentials in this file.
 """
 
 import os
@@ -58,7 +49,19 @@ def _clean(key: str) -> str:
 # ============================================================
 
 CREDENTIALS = {
-    "groq": _clean("GROQ_API_KEY"),
+    # --------------------------------------------------------
+    # GROQ
+    # --------------------------------------------------------
+
+    "groq_primary": _clean("GROQ_API_KEY"),
+
+    "groq_mdi": _clean("GROQ_API_KEY_MDI"),
+
+    "groq_uni": _clean("GROQ_API_KEY_UNI"),
+
+    # --------------------------------------------------------
+    # OTHER PROVIDERS
+    # --------------------------------------------------------
 
     "huggingface": _clean("HF_TOKEN"),
 
@@ -66,8 +69,6 @@ CREDENTIALS = {
         _clean("GEMINI_API_KEY")
         or _clean("GOOGLE_API_KEY")
     ),
-
-    
 }
 
 
@@ -82,21 +83,34 @@ if CREDENTIALS["gemini"]:
 
 PROVIDERS = {
 
-    "groq": {
-            "enabled": bool(CREDENTIALS["groq"]),
-            "free_first": False,
-        },
+    "groq_primary": {
+        "enabled": bool(CREDENTIALS["groq_primary"]),
+        "type": "groq",
+        "label": "Groq Primary",
+    },
+
+    "groq_mdi": {
+        "enabled": bool(CREDENTIALS["groq_mdi"]),
+        "type": "groq",
+        "label": "Groq MDI",
+    },
+
+    "groq_uni": {
+        "enabled": bool(CREDENTIALS["groq_uni"]),
+        "type": "groq",
+        "label": "Groq UNI",
+    },
 
     "huggingface": {
         "enabled": bool(CREDENTIALS["huggingface"]),
-        "free_first": True,
+        "type": "huggingface",
+        "label": "Hugging Face",
     },
-
-    
 
     "gemini": {
         "enabled": bool(CREDENTIALS["gemini"]),
-        "free_first": True,
+        "type": "gemini",
+        "label": "Gemini",
     },
 }
 
@@ -104,15 +118,14 @@ PROVIDERS = {
 # ============================================================
 # PROVIDER PRIORITY
 #
-# Order = fallback order.
-#
-# 1. Hugging Face
-# 2. Groq
-# 3. Gemini
+# IMPORTANT:
+# This is the actual fallback order.
 # ============================================================
 
 PROVIDER_PRIORITY = [
-    "groq",
+    "groq_primary",
+    "groq_mdi",
+    "groq_uni",
     "huggingface",
     "gemini",
 ]
@@ -121,11 +134,9 @@ PROVIDER_PRIORITY = [
 # ============================================================
 # MODEL REGISTRY
 #
-# task → provider → model
+# task_type -> logical provider -> model
 #
-# Provider order follows PROVIDER_PRIORITY:
-#
-# Hugging Face → Groq → Gemini
+# All three Groq accounts can use the same model.
 # ============================================================
 
 MODELS = {
@@ -136,14 +147,12 @@ MODELS = {
 
     "chat": {
 
-        "groq": "openai/gpt-oss-120b",
-        # Primary
+        "groq_primary": "openai/gpt-oss-120b",
+        "groq_mdi": "openai/gpt-oss-120b",
+        "groq_uni": "openai/gpt-oss-120b",
+
         "huggingface": "Qwen/Qwen3.5-9B",
 
-        # First fallback
-        
-
-        # Final fallback
         "gemini": "gemini-3.8-flash",
     },
 
@@ -154,15 +163,12 @@ MODELS = {
 
     "coding": {
 
-        "groq": "openai/gpt-oss-120b",
+        "groq_primary": "openai/gpt-oss-120b",
+        "groq_mdi": "openai/gpt-oss-120b",
+        "groq_uni": "openai/gpt-oss-120b",
 
-        # Primary coding model
         "huggingface": "Qwen/Qwen3-Coder-Next",
 
-        # First fallback
-        
-
-        # Final fallback
         "gemini": "gemini-3.8-flash",
     },
 
@@ -173,15 +179,12 @@ MODELS = {
 
     "reasoning": {
 
-        "groq": "openai/gpt-oss-120b",
+        "groq_primary": "openai/gpt-oss-120b",
+        "groq_mdi": "openai/gpt-oss-120b",
+        "groq_uni": "openai/gpt-oss-120b",
 
-        # Primary reasoning model
         "huggingface": "deepseek-ai/DeepSeek-R1",
 
-        # First fallback
-        
-
-        # Final fallback
         "gemini": "gemini-3.8-flash",
     },
 
@@ -192,15 +195,12 @@ MODELS = {
 
     "summary": {
 
-        "groq": "openai/gpt-oss-20b",
+        "groq_primary": "openai/gpt-oss-20b",
+        "groq_mdi": "openai/gpt-oss-20b",
+        "groq_uni": "openai/gpt-oss-20b",
 
-        # Primary
         "huggingface": "Qwen/Qwen3.5-9B",
 
-        # First fallback
-        
-
-        # Final fallback
         "gemini": "gemini-3.5-flash-lite",
     },
 }
@@ -219,16 +219,14 @@ DEFAULT_TASK_TYPE = "chat"
 
 RETRY_CONFIG = {
 
-    # Maximum retries for a single provider.
+    # Maximum retries for transient errors
+    # on the SAME provider.
     "max_retries": 2,
 
-    # Initial retry delay.
     "base_delay": 1.0,
 
-    # Maximum retry delay.
     "max_delay": 8.0,
 
-    # Random jitter prevents synchronized retries.
     "jitter": True,
 }
 
@@ -239,13 +237,17 @@ RETRY_CONFIG = {
 
 COOLDOWN_CONFIG = {
 
-    # Consecutive failures before cooldown.
+    # Consecutive failures before normal cooldown.
     "failure_threshold": 3,
 
-    # Provider cooldown duration.
+    # Normal provider cooldown.
     "cooldown_seconds": 120,
 
-    # Recovery check interval.
+    # Rate-limit cooldown.
+    #
+    # The provider will be skipped during this period.
+    "rate_limit_cooldown_seconds": 300,
+
     "recovery_check_seconds": 60,
 }
 
@@ -256,17 +258,18 @@ COOLDOWN_CONFIG = {
 
 FALLBACK_POLICY = {
 
-    # Enable provider fallback.
     "enabled": True,
 
-    # Retry temporary errors.
     "retry_transient_errors": True,
 
-    # Maximum number of providers attempted.
     "max_provider_attempts": len(PROVIDER_PRIORITY),
 
-    # Never retry permanent request errors indefinitely.
     "retry_permanent_errors": False,
+
+    # IMPORTANT:
+    # Rate-limit errors immediately move to
+    # the next provider/key instead of retrying.
+    "rate_limit_immediate_fallback": True,
 }
 
 
@@ -278,8 +281,8 @@ STREAMING_CONFIG = {
 
     "enabled": True,
 
-    # If streaming fails before output begins,
-    # Gateway may attempt another provider.
+    # If a provider fails before producing output,
+    # gateway can use another provider.
     "allow_pre_output_fallback": True,
 }
 
@@ -292,13 +295,10 @@ TOKEN_TRACKING = {
 
     "enabled": True,
 
-    # Never invent token counts.
     "allow_estimated_usage": False,
 
-    # Track usage separately by task.
     "track_task_type": True,
 
-    # Track provider/model.
     "track_provider": True,
 
     "track_model": True,
@@ -313,19 +313,14 @@ LOGGING_CONFIG = {
 
     "enabled": True,
 
-    # NEVER log credentials.
     "log_credentials": False,
 
-    # Do not log complete user prompts by default.
     "log_full_prompts": False,
 
-    # Log provider/model decisions.
     "log_provider_selection": True,
 
-    # Log fallback events.
     "log_fallback": True,
 
-    # Log retry events.
     "log_retries": True,
 }
 
@@ -339,7 +334,7 @@ def get_model(
     provider: str,
 ) -> str | None:
     """
-    Return the configured model for a task/provider pair.
+    Return configured model for task/provider.
     """
 
     task_models = MODELS.get(task_type)
@@ -357,7 +352,7 @@ def is_provider_enabled(
     provider: str,
 ) -> bool:
     """
-    Check whether a provider is enabled.
+    Check whether provider is enabled.
     """
 
     config = PROVIDERS.get(provider)
@@ -372,10 +367,7 @@ def is_provider_enabled(
 
 def get_enabled_providers() -> list[str]:
     """
-    Return enabled providers in priority order.
-
-    Order:
-        Hugging Face → Groq → Gemini
+    Return enabled providers in actual fallback order.
     """
 
     return [
@@ -389,24 +381,7 @@ def get_provider_chain(
     task_type: str,
 ) -> list[dict]:
     """
-    Return the provider/model fallback chain.
-
-    Example:
-
-        [   
-            {
-                "provider": "groq",
-                "model": "...",
-           },
-            {
-                "provider": "huggingface",
-                "model": "...",
-            },
-            {
-                "provider": "gemini",
-                "model": "...",
-            },
-        ]
+    Build complete provider/model fallback chain.
     """
 
     chain = []
@@ -435,10 +410,7 @@ def get_primary_provider(
     task_type: str = DEFAULT_TASK_TYPE,
 ) -> str | None:
     """
-    Return the first enabled provider for a task.
-
-    Expected primary:
-        Hugging Face
+    Return first enabled provider.
     """
 
     chain = get_provider_chain(task_type)
@@ -453,7 +425,7 @@ def get_primary_model(
     task_type: str = DEFAULT_TASK_TYPE,
 ) -> str | None:
     """
-    Return the primary model for a task.
+    Return model of first enabled provider.
     """
 
     chain = get_provider_chain(task_type)
@@ -467,8 +439,6 @@ def get_primary_model(
 def validate_configuration() -> dict:
     """
     Validate provider/model configuration.
-
-    Returns a diagnostic dictionary.
     """
 
     result = {
@@ -490,6 +460,10 @@ def validate_configuration() -> dict:
             "has_credential": bool(
                 CREDENTIALS.get(provider)
             ),
+            "type": PROVIDERS.get(
+                provider,
+                {},
+            ).get("type"),
         }
 
     # --------------------------------------------------------
@@ -511,7 +485,7 @@ def validate_configuration() -> dict:
             }
 
     # --------------------------------------------------------
-    # At least one provider should be available.
+    # At least one provider
     # --------------------------------------------------------
 
     if not get_enabled_providers():

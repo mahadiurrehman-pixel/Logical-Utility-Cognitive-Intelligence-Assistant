@@ -1,382 +1,1469 @@
 """
-LUCIA LLM Gateway
-Central routing, retry, health tracking, logging, and streaming engine.
-All LLM calls go through this single gateway.
+LUCIA Multi-Provider LLM Gateway
+
+Fallback order:
+
+    Groq Primary
+        ↓
+    Groq MDI
+        ↓
+    Groq UNI
+        ↓
+    Hugging Face
+        ↓
+    Gemini
+
+Features:
+
+- Multiple independent Groq API keys
+- Per-provider health
+- Per-provider cooldown
+- Immediate fallback on rate limits
+- Retry transient failures
+- Provider/model tracking
+- Token tracking
+- Streaming fallback
+- Detailed terminal diagnostics
+- No API keys printed/logged
 """
-import time
-import random
+
 import logging
-from datetime import datetime, timedelta
-from typing import Iterator, Optional, List, Dict, Any
-from dataclasses import dataclass, field
+import random
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Iterator, Optional
 
 from llm_config import (
-    PROVIDER_PRIORITY, MODELS, RETRY_CONFIG, COOLDOWN_CONFIG,
-    DEFAULT_TASK_TYPE, CREDENTIALS
+    PROVIDER_PRIORITY,
+    MODELS,
+    RETRY_CONFIG,
+    COOLDOWN_CONFIG,
+    DEFAULT_TASK_TYPE,
+    FALLBACK_POLICY,
+    STREAMING_CONFIG,
 )
-from providers.base import LLMProvider, ProviderResponse, ProviderStreamChunk, TokenUsage
+
+from providers.base import (
+    ProviderResponse,
+    ProviderStreamChunk,
+    TokenUsage,
+)
+
+from providers.groq_provider import GroqProvider
 from providers.huggingface_provider import HuggingFaceProvider
 from providers.gemini_provider import GeminiProvider
-from providers.groq_provider import GroqProvider
-
-# ==========================================
-# LOGGING SETUP
-# ==========================================
-logger = logging.getLogger("lucia.gateway")
-logger.setLevel(logging.INFO)
-if not logger.handlers:
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter(
-        "[%(asctime)s] %(levelname)s | %(message)s", datefmt="%H:%M:%S"
-    ))
-    logger.addHandler(handler)
 
 
-# ==========================================
-# ERROR CLASSIFICATION
-# ==========================================
+# ============================================================
+# LOGGING
+# ============================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(message)s",
+)
+
+logger = logging.getLogger("lucia.llm_gateway")
+
+
+# ============================================================
+# TERMINAL DISPLAY HELPERS
+# ============================================================
+
+def _separator():
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+
+def _display_name(provider: str) -> str:
+    """
+    Convert internal provider IDs into readable names.
+    """
+
+    names = {
+        "groq_primary": "Groq Primary",
+        "groq_mdi": "Groq MDI",
+        "groq_uni": "Groq UNI",
+        "huggingface": "Hugging Face",
+        "gemini": "Gemini",
+    }
+
+    return names.get(provider, provider)
+
+
+def _print_request(
+    task_type: str,
+    provider: str,
+    model: str,
+):
+    """
+    Display current provider/model selection.
+    """
+
+    print()
+    _separator()
+    print("🤖 LUCIA LLM REQUEST")
+    _separator()
+    print(f"🧠 Task     : {task_type}")
+    print(f"🔌 Provider : {_display_name(provider)}")
+    print(f"🤖 Model    : {model}")
+    print("⏳ Status   : Processing...")
+    _separator()
+
+
+def _print_success(
+    task_type: str,
+    provider: str,
+    model: str,
+    usage: Optional[TokenUsage] = None,
+    elapsed: Optional[float] = None,
+):
+    """
+    Display successful provider response.
+    """
+
+    print()
+    _separator()
+    print("✅ LUCIA RESPONSE")
+    _separator()
+    print(f"🧠 Task     : {task_type}")
+    print(f"🔌 Provider : {_display_name(provider)}")
+    print(f"🤖 Model    : {model}")
+
+    if elapsed is not None:
+        print(f"⏱️  Time     : {elapsed:.2f}s")
+
+    if usage:
+
+        if usage.input_tokens is not None:
+            print(
+                f"📥 Input    : "
+                f"{usage.input_tokens} tokens"
+            )
+
+        if usage.output_tokens is not None:
+            print(
+                f"📤 Output   : "
+                f"{usage.output_tokens} tokens"
+            )
+
+        if usage.total_tokens is not None:
+            print(
+                f"📊 Total    : "
+                f"{usage.total_tokens} tokens"
+            )
+
+    _separator()
+    print()
+
+
+def _print_rate_limit(
+    provider: str,
+    model: str,
+    error: Exception,
+):
+    """
+    Display rate-limit fallback.
+    """
+
+    print()
+    print("⚠️  RATE LIMIT DETECTED")
+    print(f"🔌 Provider : {_display_name(provider)}")
+    print(f"🤖 Model    : {model}")
+    print(f"❌ Error    : {error}")
+    print("🔄 Action   : Falling back immediately")
+    print()
+
+
+def _print_retry(
+    provider: str,
+    model: str,
+    error: Exception,
+    attempt: int,
+    max_retries: int,
+    delay: float,
+):
+    """
+    Display transient retry information.
+    """
+
+    print()
+    print("⚠️  PROVIDER ERROR")
+    print(f"🔌 Provider : {_display_name(provider)}")
+    print(f"🤖 Model    : {model}")
+    print(f"❌ Error    : {type(error).__name__}")
+    print(f"📝 Details  : {error}")
+    print(
+        f"🔄 Retry    : "
+        f"{attempt + 1}/{max_retries}"
+    )
+    print(f"⏳ Waiting  : {delay:.2f}s")
+    print()
+
+
+def _print_fallback(
+    from_provider: str,
+    to_provider: str,
+    to_model: str,
+):
+    """
+    Display provider fallback transition.
+    """
+
+    print(
+        f"➡️  Fallback: "
+        f"{_display_name(from_provider)}"
+        f" → "
+        f"{_display_name(to_provider)}"
+    )
+
+    print(f"   🤖 Model: {to_model}")
+    print()
+
+
+def _print_disabled(
+    provider: str,
+    reason: str,
+):
+    """
+    Display provider disable event.
+    """
+
+    print()
+    print("🚫 PROVIDER DISABLED")
+    print(f"🔌 Provider : {_display_name(provider)}")
+    print(f"📝 Reason   : {reason}")
+    print()
+
+
+# ============================================================
+# ERRORS
+# ============================================================
+
 class GatewayError(Exception):
-    """Base gateway error"""
     pass
+
 
 class TransientProviderError(GatewayError):
     pass
 
-class RateLimitError(TransientProviderError):
+
+class RateLimitError(GatewayError):
     pass
+
 
 class AuthenticationError(GatewayError):
     pass
 
+
 class InvalidRequestError(GatewayError):
     pass
 
-class ProviderUnavailableError(TransientProviderError):
+
+class ProviderUnavailableError(GatewayError):
     pass
 
-class TimeoutError(TransientProviderError):
+
+class TimeoutError(GatewayError):
     pass
+
 
 class PermanentProviderError(GatewayError):
     pass
 
 
-def classify_error(error: Exception) -> GatewayError:
-    """Classify raw exceptions into gateway error categories"""
-    err_str = str(error).lower()
-    
-    if "429" in err_str or "rate limit" in err_str or "too many requests" in err_str:
+# ============================================================
+# ERROR CLASSIFICATION
+# ============================================================
+
+def classify_error(
+    error: Exception,
+) -> GatewayError:
+    """
+    Convert arbitrary provider exceptions into
+    gateway-level error classes.
+    """
+
+    message = str(error).lower()
+
+    # --------------------------------------------------------
+    # RATE LIMIT
+    # --------------------------------------------------------
+
+    rate_limit_markers = [
+        "429",
+        "rate limit",
+        "rate_limit",
+        "rate_limit_exceeded",
+        "too many requests",
+        "tokens per day",
+        "tpd",
+        "tokens per minute",
+        "tpm",
+        "quota exceeded",
+        "quota_exceeded",
+    ]
+
+    if any(
+        marker in message
+        for marker in rate_limit_markers
+    ):
         return RateLimitError(str(error))
-    if "401" in err_str or "403" in err_str or "invalid api key" in err_str or "authentication" in err_str or "unauthorized" in err_str:
+
+    # --------------------------------------------------------
+    # AUTHENTICATION
+    # --------------------------------------------------------
+
+    auth_markers = [
+        "401",
+        "403",
+        "unauthorized",
+        "invalid api key",
+        "invalid_api_key",
+        "authentication",
+        "permission denied",
+        "forbidden",
+    ]
+
+    if any(
+        marker in message
+        for marker in auth_markers
+    ):
         return AuthenticationError(str(error))
-    if "timeout" in err_str or "timed out" in err_str:
+
+    # --------------------------------------------------------
+    # TIMEOUT
+    # --------------------------------------------------------
+
+    timeout_markers = [
+        "timeout",
+        "timed out",
+        "read timeout",
+        "connect timeout",
+    ]
+
+    if any(
+        marker in message
+        for marker in timeout_markers
+    ):
         return TimeoutError(str(error))
-    if "500" in err_str or "502" in err_str or "503" in err_str or "504" in err_str or "unavailable" in err_str:
+
+    # --------------------------------------------------------
+    # SERVER / AVAILABILITY
+    # --------------------------------------------------------
+
+    unavailable_markers = [
+        "500",
+        "502",
+        "503",
+        "504",
+        "service unavailable",
+        "bad gateway",
+        "temporarily unavailable",
+        "server error",
+    ]
+
+    if any(
+        marker in message
+        for marker in unavailable_markers
+    ):
         return ProviderUnavailableError(str(error))
-    if "400" in err_str or "invalid request" in err_str or "bad request" in err_str:
+
+    # --------------------------------------------------------
+    # INVALID REQUEST
+    # --------------------------------------------------------
+
+    invalid_markers = [
+        "400",
+        "invalid request",
+        "bad request",
+        "invalid argument",
+        "invalid parameter",
+    ]
+
+    if any(
+        marker in message
+        for marker in invalid_markers
+    ):
         return InvalidRequestError(str(error))
-    
+
+    # --------------------------------------------------------
+    # DEFAULT
+    # --------------------------------------------------------
+
     return TransientProviderError(str(error))
 
 
-# ==========================================
-# PROVIDER HEALTH TRACKER
-# ==========================================
+# ============================================================
+# PROVIDER HEALTH
+# ============================================================
+
 @dataclass
 class ProviderHealth:
-    status: str = "HEALTHY"          # HEALTHY | COOLDOWN | DISABLED
+
+    status: str = "HEALTHY"
+
     failure_count: int = 0
+
     last_failure: Optional[datetime] = None
-    cooldown_until: Optional[datetime] = None
+
+    cooldown_until: Optional[float] = None
+
     last_success: Optional[datetime] = None
 
+    last_error_type: Optional[str] = None
 
-# ==========================================
-# TOKEN USAGE TRACKER
-# ==========================================
+
+# ============================================================
+# USAGE RECORD
+# ============================================================
+
 @dataclass
 class UsageRecord:
+
+    timestamp: datetime
+
     provider: str
+
     model: str
+
     task_type: str
-    input_tokens: Optional[int]
-    output_tokens: Optional[int]
-    total_tokens: Optional[int]
-    timestamp: str
-    success: bool
+
+    input_tokens: Optional[int] = None
+
+    output_tokens: Optional[int] = None
+
+    total_tokens: Optional[int] = None
 
 
-# ==========================================
-# LLM GATEWAY
-# ==========================================
+# ============================================================
+# GATEWAY
+# ============================================================
+
 class LLMGateway:
-    """
-    Central LLM Gateway with multi-provider routing, retry, health, and streaming.
-    Drop-in replacement for LangChain ChatModel (.invoke and .stream).
-    """
 
     def __init__(self):
-        # Initialize all providers
-        self._providers: Dict[str, LLMProvider] = {
+
+        # ----------------------------------------------------
+        # PROVIDERS
+        # ----------------------------------------------------
+
+        self._providers = {
+
+            "groq_primary": GroqProvider(
+                "groq_primary"
+            ),
+
+            "groq_mdi": GroqProvider(
+                "groq_mdi"
+            ),
+
+            "groq_uni": GroqProvider(
+                "groq_uni"
+            ),
+
             "huggingface": HuggingFaceProvider(),
+
             "gemini": GeminiProvider(),
-            "groq": GroqProvider(),
         }
-        
-        # Health state
-        self._health: Dict[str, ProviderHealth] = {
-            name: ProviderHealth() for name in self._providers
+
+        # ----------------------------------------------------
+        # HEALTH
+        # ----------------------------------------------------
+
+        self._health = {
+            name: ProviderHealth()
+            for name in self._providers
         }
-        
-        # Usage log (in-memory, last 100 records)
-        self._usage_log: List[UsageRecord] = []
+
+        # ----------------------------------------------------
+        # USAGE
+        # ----------------------------------------------------
+
+        self._usage_log = []
+
         self._max_usage_records = 100
 
-    # ==========================================
-    # PUBLIC INTERFACE (Backward Compatible)
-    # ==========================================
-    def invoke(self, messages: list, task_type: str = DEFAULT_TASK_TYPE, **kwargs) -> Any:
-        """
-        Drop-in replacement for ChatModel.invoke().
-        Returns an object with .content attribute (like AIMessage).
-        """
-        response = self._generate_with_fallback(messages, task_type, stream=False)
-        
-        # Return a simple object with .content for backward compatibility
-        class CompatResponse:
-            def __init__(self, content):
-                self.content = content
-        return CompatResponse(response.content)
+    # ========================================================
+    # PUBLIC INVOKE
+    # ========================================================
 
-    def stream(self, messages: list, task_type: str = DEFAULT_TASK_TYPE, **kwargs) -> Iterator:
-        """
-        Drop-in replacement for ChatModel.stream().
-        Yields objects with .content attribute (like AIMessageChunk).
-        """
-        yield from self._stream_with_fallback(messages, task_type)
+    def invoke(
+        self,
+        messages: list,
+        task_type: str = DEFAULT_TASK_TYPE,
+        **kwargs,
+    ) -> ProviderResponse:
 
-    # ==========================================
-    # MODEL SELECTION
-    # ==========================================
-    def _get_model_id(self, provider_name: str, task_type: str) -> Optional[str]:
-        task_models = MODELS.get(task_type, MODELS[DEFAULT_TASK_TYPE])
-        return task_models.get(provider_name)
+        return self._generate_with_fallback(
+            messages=messages,
+            task_type=task_type,
+            **kwargs,
+        )
 
-    # ==========================================
+    # ========================================================
+    # PUBLIC STREAM
+    # ========================================================
+
+    def stream(
+        self,
+        messages: list,
+        task_type: str = DEFAULT_TASK_TYPE,
+        **kwargs,
+    ) -> Iterator[ProviderStreamChunk]:
+
+        yield from self._stream_with_fallback(
+            messages=messages,
+            task_type=task_type,
+            **kwargs,
+        )
+
+    # ========================================================
+    # MODEL
+    # ========================================================
+
+    def _get_model_id(
+        self,
+        provider_name: str,
+        task_type: str,
+    ) -> Optional[str]:
+
+        task_models = MODELS.get(
+            task_type,
+            MODELS.get(
+                DEFAULT_TASK_TYPE,
+                {},
+            ),
+        )
+
+        return task_models.get(
+            provider_name
+        )
+
+    # ========================================================
     # HEALTH CHECK
-    # ==========================================
-    def _is_provider_healthy(self, name: str) -> bool:
-        health = self._health[name]
-        provider = self._providers[name]
-        
-        if not provider.is_available():
+    # ========================================================
+
+    def _is_provider_healthy(
+        self,
+        provider_name: str,
+    ) -> bool:
+
+        provider = self._providers.get(
+            provider_name
+        )
+
+        if not provider:
             return False
-        
+
+        # ----------------------------------------------------
+        # Credential / provider availability
+        # ----------------------------------------------------
+
+        try:
+
+            if not provider.is_available():
+                return False
+
+        except Exception:
+
+            return False
+
+        # ----------------------------------------------------
+        # Health state
+        # ----------------------------------------------------
+
+        health = self._health[
+            provider_name
+        ]
+
+        # ----------------------------------------------------
+        # Disabled
+        # ----------------------------------------------------
+
         if health.status == "DISABLED":
+
             return False
-        
-        if health.status == "COOLDOWN":
-            if health.cooldown_until and datetime.now() > health.cooldown_until:
-                health.status = "HEALTHY"
-                health.failure_count = 0
-                logger.info(f"Provider '{name}' cooldown expired → HEALTHY")
-                return True
-            return False
-        
+
+        # ----------------------------------------------------
+        # Cooldown
+        # ----------------------------------------------------
+
+        if health.cooldown_until:
+
+            if time.time() < health.cooldown_until:
+
+                return False
+
+            # Cooldown expired.
+            health.cooldown_until = None
+            health.status = "HEALTHY"
+
         return True
 
-    def _mark_failure(self, name: str, error: GatewayError):
-        health = self._health[name]
+    # ========================================================
+    # MARK FAILURE
+    # ========================================================
+
+    def _mark_failure(
+        self,
+        provider_name: str,
+        error: GatewayError,
+    ):
+
+        health = self._health[
+            provider_name
+        ]
+
         health.failure_count += 1
+
         health.last_failure = datetime.now()
-        
-        if isinstance(error, AuthenticationError):
+
+        health.last_error_type = type(
+            error
+        ).__name__
+
+        # ----------------------------------------------------
+        # AUTHENTICATION
+        # ----------------------------------------------------
+
+        if isinstance(
+            error,
+            AuthenticationError,
+        ):
+
             health.status = "DISABLED"
-            logger.warning(f"Provider '{name}' DISABLED (auth failure)")
-        elif health.failure_count >= COOLDOWN_CONFIG["failure_threshold"]:
-            health.status = "COOLDOWN"
-            health.cooldown_until = datetime.now() + timedelta(
-                seconds=COOLDOWN_CONFIG["cooldown_seconds"]
-            )
-            logger.warning(
-                f"Provider '{name}' → COOLDOWN until {health.cooldown_until.strftime('%H:%M:%S')}"
+
+            health.cooldown_until = None
+
+            logger.error(
+                "Provider %s disabled due to authentication failure",
+                provider_name,
             )
 
-    def _mark_success(self, name: str):
-        health = self._health[name]
+            _print_disabled(
+                provider_name,
+                "Authentication/API key failure",
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # RATE LIMIT
+        # ----------------------------------------------------
+
+        if isinstance(
+            error,
+            RateLimitError,
+        ):
+
+            health.status = "COOLDOWN"
+
+            health.cooldown_until = (
+                time.time()
+                + COOLDOWN_CONFIG.get(
+                    "rate_limit_cooldown_seconds",
+                    300,
+                )
+            )
+
+            logger.warning(
+                "Provider %s rate-limited; cooldown activated",
+                provider_name,
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # NORMAL TRANSIENT FAILURES
+        # ----------------------------------------------------
+
+        threshold = COOLDOWN_CONFIG.get(
+            "failure_threshold",
+            3,
+        )
+
+        if health.failure_count >= threshold:
+
+            health.status = "COOLDOWN"
+
+            health.cooldown_until = (
+                time.time()
+                + COOLDOWN_CONFIG.get(
+                    "cooldown_seconds",
+                    120,
+                )
+            )
+
+            logger.warning(
+                "Provider %s entered cooldown after %s failures",
+                provider_name,
+                health.failure_count,
+            )
+
+    # ========================================================
+    # MARK SUCCESS
+    # ========================================================
+
+    def _mark_success(
+        self,
+        provider_name: str,
+    ):
+
+        health = self._health[
+            provider_name
+        ]
+
         health.status = "HEALTHY"
+
         health.failure_count = 0
+
+        health.cooldown_until = None
+
         health.last_success = datetime.now()
 
-    # ==========================================
-    # USAGE TRACKING
-    # ==========================================
-    def _record_usage(self, usage: Optional[TokenUsage], success: bool):
+        health.last_error_type = None
+
+    # ========================================================
+    # USAGE
+    # ========================================================
+
+    def _record_usage(
+        self,
+        usage: Optional[TokenUsage],
+    ):
+
         if not usage:
             return
+
         record = UsageRecord(
+
+            timestamp=datetime.now(),
+
             provider=usage.provider,
+
             model=usage.model,
+
             task_type=usage.task_type,
+
             input_tokens=usage.input_tokens,
+
             output_tokens=usage.output_tokens,
+
             total_tokens=usage.total_tokens,
-            timestamp=datetime.now().isoformat(),
-            success=success,
         )
+
         self._usage_log.append(record)
-        if len(self._usage_log) > self._max_usage_records:
-            self._usage_log.pop(0)
-        
-        if usage.input_tokens is not None:
-            logger.info(
-                f"Tokens [{usage.provider}/{usage.model}] "
-                f"in={usage.input_tokens} out={usage.output_tokens} "
-                f"total={usage.total_tokens}"
+
+        if len(
+            self._usage_log
+        ) > self._max_usage_records:
+
+            self._usage_log = (
+                self._usage_log[
+                    -self._max_usage_records:
+                ]
             )
 
-    # ==========================================
-    # RETRY LOGIC
-    # ==========================================
-    def _should_retry(self, error: GatewayError, attempt: int) -> bool:
-        if attempt >= RETRY_CONFIG["max_retries"]:
-            return False
-        if isinstance(error, (AuthenticationError, InvalidRequestError, PermanentProviderError)):
-            return False
-        return True
+    # ========================================================
+    # RETRY DECISION
+    # ========================================================
 
-    def _get_delay(self, attempt: int) -> float:
-        delay = min(
-            RETRY_CONFIG["base_delay"] * (2 ** attempt),
-            RETRY_CONFIG["max_delay"]
+    def _should_retry(
+        self,
+        error: GatewayError,
+        attempt: int,
+    ) -> bool:
+
+        max_retries = RETRY_CONFIG.get(
+            "max_retries",
+            2,
         )
-        if RETRY_CONFIG["jitter"]:
-            delay += random.uniform(0.1, 0.5)
+
+        if attempt >= max_retries:
+            return False
+
+        # ----------------------------------------------------
+        # NEVER retry these
+        # ----------------------------------------------------
+
+        if isinstance(
+            error,
+            (
+                RateLimitError,
+                AuthenticationError,
+                InvalidRequestError,
+                PermanentProviderError,
+            ),
+        ):
+
+            return False
+
+        return (
+            FALLBACK_POLICY.get(
+                "retry_transient_errors",
+                True,
+            )
+        )
+
+    # ========================================================
+    # RETRY DELAY
+    # ========================================================
+
+    def _get_delay(
+        self,
+        attempt: int,
+    ) -> float:
+
+        base_delay = RETRY_CONFIG.get(
+            "base_delay",
+            1.0,
+        )
+
+        max_delay = RETRY_CONFIG.get(
+            "max_delay",
+            8.0,
+        )
+
+        delay = min(
+            base_delay * (
+                2 ** attempt
+            ),
+            max_delay,
+        )
+
+        if RETRY_CONFIG.get(
+            "jitter",
+            True,
+        ):
+
+            delay += random.uniform(
+                0.1,
+                0.5,
+            )
+
         return delay
 
-    # ==========================================
-    # CORE GENERATION (with fallback chain)
-    # ==========================================
-    def _get_active_providers(self, task_type: str) -> List[str]:
-        """Get ordered list of healthy providers that have a model for this task"""
+    # ========================================================
+    # ACTIVE PROVIDERS
+    # ========================================================
+
+    def _get_active_providers(
+        self,
+        task_type: str,
+    ) -> list[tuple[str, str]]:
+
         active = []
-        for name in PROVIDER_PRIORITY:
-            if self._is_provider_healthy(name) and self._get_model_id(name, task_type):
-                active.append(name)
+
+        for provider_name in PROVIDER_PRIORITY:
+
+            if not self._is_provider_healthy(
+                provider_name
+            ):
+                continue
+
+            model_id = self._get_model_id(
+                provider_name,
+                task_type,
+            )
+
+            if not model_id:
+                continue
+
+            active.append(
+                (
+                    provider_name,
+                    model_id,
+                )
+            )
+
         return active
 
-    def _generate_with_fallback(self, messages: list, task_type: str, stream: bool = False) -> ProviderResponse:
-        active_providers = self._get_active_providers(task_type)
-        
+    # ========================================================
+    # GENERATION FALLBACK
+    # ========================================================
+
+    def _generate_with_fallback(
+        self,
+        messages: list,
+        task_type: str,
+        **kwargs,
+    ) -> ProviderResponse:
+
+        active_providers = (
+            self._get_active_providers(
+                task_type
+            )
+        )
+
         if not active_providers:
-            logger.error("No healthy providers available!")
-            class EmptyResponse:
-                content = "Koi bhi AI provider abhi available nahi hai bhai. Thodi der baad try karein."
-            return EmptyResponse()
+
+            raise GatewayError(
+                "No LLM providers are currently available."
+            )
+
+        max_provider_attempts = (
+            FALLBACK_POLICY.get(
+                "max_provider_attempts",
+                len(active_providers),
+            )
+        )
+
+        active_providers = (
+            active_providers[
+                :max_provider_attempts
+            ]
+        )
 
         last_error = None
-        
-        for provider_name in active_providers:
-            model_id = self._get_model_id(provider_name, task_type)
-            provider = self._providers[provider_name]
-            
-            for attempt in range(RETRY_CONFIG["max_retries"] + 1):
+
+        # ----------------------------------------------------
+        # REQUEST START
+        # ----------------------------------------------------
+
+        print()
+        print("╔════════════════════════════════════════╗")
+        print("║       🧠 LUCIA MODEL ROUTER            ║")
+        print("╚════════════════════════════════════════╝")
+
+        print(
+            f"📋 Task: {task_type}"
+        )
+
+        print(
+            f"🔗 Provider chain: "
+            f"{' → '.join(_display_name(p) for p, _ in active_providers)}"
+        )
+
+        print()
+
+        # ----------------------------------------------------
+        # PROVIDER FALLBACK LOOP
+        # ----------------------------------------------------
+
+        for index, (
+            provider_name,
+            model_id,
+        ) in enumerate(active_providers):
+
+            provider = self._providers[
+                provider_name
+            ]
+
+            # ------------------------------------------------
+            # DISPLAY PROVIDER
+            # ------------------------------------------------
+
+            _print_request(
+                task_type=task_type,
+                provider=provider_name,
+                model=model_id,
+            )
+
+            logger.info(
+                "Trying LLM provider=%s model=%s",
+                provider_name,
+                model_id,
+            )
+
+            attempt = 0
+
+            # Track start time.
+            provider_start = time.perf_counter()
+
+            # ------------------------------------------------
+            # RETRY SAME PROVIDER
+            # ------------------------------------------------
+
+            while True:
+
                 try:
-                    logger.info(f"Request → {provider_name}/{model_id} (task={task_type}, attempt={attempt+1})")
-                    response = provider.generate(messages, model_id, task_type=task_type)
-                    self._mark_success(provider_name)
-                    self._record_usage(response.usage, success=True)
-                    logger.info(f"Response ← {provider_name}/{model_id} ✓")
+
+                    response = provider.generate(
+                        messages,
+                        model_id,
+                        task_type=task_type,
+                        **kwargs,
+                    )
+
+                    elapsed = (
+                        time.perf_counter()
+                        - provider_start
+                    )
+
+                    self._mark_success(
+                        provider_name
+                    )
+
+                    self._record_usage(
+                        response.usage
+                    )
+
+                    _print_success(
+                        task_type=task_type,
+                        provider=provider_name,
+                        model=model_id,
+                        usage=response.usage,
+                        elapsed=elapsed,
+                    )
+
                     return response
-                    
+
                 except Exception as raw_error:
-                    classified = classify_error(raw_error)
-                    last_error = classified
-                    logger.warning(f"{provider_name} error: {type(classified).__name__}: {classified}")
-                    self._record_usage(None, success=False)
-                    
-                    if self._should_retry(classified, attempt):
-                        delay = self._get_delay(attempt)
-                        logger.info(f"Retrying {provider_name} in {delay:.1f}s...")
-                        time.sleep(delay)
-                    else:
-                        self._mark_failure(provider_name, classified)
+
+                    error = classify_error(
+                        raw_error
+                    )
+
+                    last_error = error
+
+                    logger.warning(
+                        "Provider %s failed: %s: %s",
+                        provider_name,
+                        type(error).__name__,
+                        error,
+                    )
+
+                    # ----------------------------------------
+                    # RATE LIMIT
+                    #
+                    # DO NOT RETRY.
+                    # Immediately move to next provider.
+                    # ----------------------------------------
+
+                    if isinstance(
+                        error,
+                        RateLimitError,
+                    ):
+
+                        self._mark_failure(
+                            provider_name,
+                            error,
+                        )
+
+                        _print_rate_limit(
+                            provider=provider_name,
+                            model=model_id,
+                            error=error,
+                        )
+
                         break
-            
-            logger.info(f"Falling back from {provider_name}...")
 
-        # All providers failed
-        logger.error(f"All providers failed. Last error: {last_error}")
-        class FallbackResponse:
-            content = "Server par thoda load hai bhai, ek minute baad dobara try karein."
-        return FallbackResponse()
+                    # ----------------------------------------
+                    # PERMANENT / AUTH
+                    # ----------------------------------------
 
-    def _stream_with_fallback(self, messages: list, task_type: str) -> Iterator:
-        active_providers = self._get_active_providers(task_type)
-        
+                    if isinstance(
+                        error,
+                        (
+                            AuthenticationError,
+                            InvalidRequestError,
+                            PermanentProviderError,
+                        ),
+                    ):
+
+                        self._mark_failure(
+                            provider_name,
+                            error,
+                        )
+
+                        print()
+                        print("❌ PROVIDER FAILED")
+                        print(
+                            f"🔌 Provider : "
+                            f"{_display_name(provider_name)}"
+                        )
+                        print(
+                            f"🤖 Model    : {model_id}"
+                        )
+                        print(
+                            f"❌ Error    : "
+                            f"{type(error).__name__}"
+                        )
+                        print(
+                            f"📝 Details  : {error}"
+                        )
+                        print()
+
+                        break
+
+                    # ----------------------------------------
+                    # TRANSIENT RETRY
+                    # ----------------------------------------
+
+                    if self._should_retry(
+                        error,
+                        attempt,
+                    ):
+
+                        delay = self._get_delay(
+                            attempt
+                        )
+
+                        _print_retry(
+                            provider=provider_name,
+                            model=model_id,
+                            error=error,
+                            attempt=attempt,
+                            max_retries=RETRY_CONFIG.get(
+                                "max_retries",
+                                2,
+                            ),
+                            delay=delay,
+                        )
+
+                        time.sleep(delay)
+
+                        attempt += 1
+
+                        continue
+
+                    # ----------------------------------------
+                    # RETRIES EXHAUSTED
+                    # ----------------------------------------
+
+                    self._mark_failure(
+                        provider_name,
+                        error,
+                    )
+
+                    print()
+                    print("❌ PROVIDER FAILED")
+                    print(
+                        f"🔌 Provider : "
+                        f"{_display_name(provider_name)}"
+                    )
+                    print(
+                        f"🤖 Model    : {model_id}"
+                    )
+                    print(
+                        f"❌ Error    : "
+                        f"{type(error).__name__}"
+                    )
+                    print(
+                        f"📝 Details  : {error}"
+                    )
+                    print(
+                        "➡️  Moving to next provider..."
+                    )
+                    print()
+
+                    break
+
+            # ------------------------------------------------
+            # FALLBACK TO NEXT PROVIDER
+            # ------------------------------------------------
+
+            if index + 1 < len(
+                active_providers
+            ):
+
+                next_provider, next_model = (
+                    active_providers[index + 1]
+                )
+
+                _print_fallback(
+                    from_provider=provider_name,
+                    to_provider=next_provider,
+                    to_model=next_model,
+                )
+
+        # ====================================================
+        # ALL PROVIDERS FAILED
+        # ====================================================
+
+        print()
+        print("╔════════════════════════════════════════╗")
+        print("║       ❌ LUCIA ALL PROVIDERS FAILED    ║")
+        print("╚════════════════════════════════════════╝")
+
+        error_message = (
+            str(last_error)
+            if last_error
+            else "Unknown provider failure"
+        )
+
+        print(
+            f"📝 Last error: {error_message}"
+        )
+
+        print()
+
+        raise GatewayError(
+            "All configured LLM providers failed. "
+            f"Last error: {error_message}"
+        )
+
+    # ========================================================
+    # STREAMING FALLBACK
+    # ========================================================
+
+    def _stream_with_fallback(
+        self,
+        messages: list,
+        task_type: str,
+        **kwargs,
+    ) -> Iterator[ProviderStreamChunk]:
+
+        active_providers = (
+            self._get_active_providers(
+                task_type
+            )
+        )
+
         if not active_providers:
-            yield ProviderStreamChunk(content="Koi bhi AI provider abhi available nahi hai bhai.")
-            return
 
-        for provider_name in active_providers:
-            model_id = self._get_model_id(provider_name, task_type)
-            provider = self._providers[provider_name]
-            
+            raise GatewayError(
+                "No LLM providers are currently available."
+            )
+
+        print()
+        print("╔════════════════════════════════════════╗")
+        print("║       ⚡ LUCIA STREAMING ROUTER        ║")
+        print("╚════════════════════════════════════════╝")
+
+        print(
+            f"📋 Task: {task_type}"
+        )
+
+        print(
+            f"🔗 Chain: "
+            f"{' → '.join(_display_name(p) for p, _ in active_providers)}"
+        )
+
+        print()
+
+        # ----------------------------------------------------
+        # Each provider gets a fresh output_started state.
+        # ----------------------------------------------------
+
+        for index, (
+            provider_name,
+            model_id,
+        ) in enumerate(active_providers):
+
+            provider = self._providers[
+                provider_name
+            ]
+
+            output_started = False
+
+            _print_request(
+                task_type=task_type,
+                provider=provider_name,
+                model=model_id,
+            )
+
             try:
-                logger.info(f"Stream → {provider_name}/{model_id} (task={task_type})")
-                chunk_count = 0
-                
-                for chunk in provider.stream(messages, model_id, task_type=task_type):
-                    chunk_count += 1
-                    # Yield LangChain-compatible chunk
-                    class CompatChunk:
-                        def __init__(self, content):
-                            self.content = content
-                    yield CompatChunk(chunk.content)
-                
-                self._mark_success(provider_name)
-                logger.info(f"Stream ← {provider_name}/{model_id} ✓ ({chunk_count} chunks)")
-                return  # Stream completed successfully
-                
-            except Exception as raw_error:
-                classified = classify_error(raw_error)
-                logger.warning(f"{provider_name} stream error: {classified}")
-                self._mark_failure(provider_name, classified)
-                continue
-        
-        yield ProviderStreamChunk(content="Server par load hai bhai, dobara try karein.")
 
-    # ==========================================
-    # DIAGNOSTICS
-    # ==========================================
-    def get_health_report(self) -> Dict:
+                stream_start = time.perf_counter()
+
+                for chunk in provider.stream(
+                    messages,
+                    model_id,
+                    task_type=task_type,
+                    **kwargs,
+                ):
+
+                    if chunk.content:
+
+                        output_started = True
+
+                        yield chunk
+
+                elapsed = (
+                    time.perf_counter()
+                    - stream_start
+                )
+
+                self._mark_success(
+                    provider_name
+                )
+
+                print()
+                _separator()
+                print("✅ STREAM COMPLETE")
+                _separator()
+                print(
+                    f"🔌 Provider : "
+                    f"{_display_name(provider_name)}"
+                )
+                print(
+                    f"🤖 Model    : {model_id}"
+                )
+                print(
+                    f"⏱️  Time     : {elapsed:.2f}s"
+                )
+                _separator()
+                print()
+
+                return
+
+            except Exception as raw_error:
+
+                error = classify_error(
+                    raw_error
+                )
+
+                self._mark_failure(
+                    provider_name,
+                    error,
+                )
+
+                # --------------------------------------------
+                # Display error
+                # --------------------------------------------
+
+                print()
+                print("❌ STREAMING PROVIDER FAILED")
+                print(
+                    f"🔌 Provider : "
+                    f"{_display_name(provider_name)}"
+                )
+                print(
+                    f"🤖 Model    : {model_id}"
+                )
+                print(
+                    f"❌ Error    : "
+                    f"{type(error).__name__}"
+                )
+                print(
+                    f"📝 Details  : {error}"
+                )
+                print()
+
+                # --------------------------------------------
+                # If output already started, don't switch.
+                # --------------------------------------------
+
+                if output_started:
+
+                    raise GatewayError(
+                        "Streaming failed after output "
+                        f"started from provider "
+                        f"{provider_name}: {error}"
+                    )
+
+                # --------------------------------------------
+                # Pre-output fallback
+                # --------------------------------------------
+
+                if not STREAMING_CONFIG.get(
+                    "allow_pre_output_fallback",
+                    True,
+                ):
+
+                    raise GatewayError(
+                        f"Streaming failed: {error}"
+                    )
+
+                if index + 1 < len(
+                    active_providers
+                ):
+
+                    next_provider, next_model = (
+                        active_providers[index + 1]
+                    )
+
+                    _print_fallback(
+                        from_provider=provider_name,
+                        to_provider=next_provider,
+                        to_model=next_model,
+                    )
+
+                    continue
+
+        # ====================================================
+        # ALL STREAMING PROVIDERS FAILED
+        # ====================================================
+
+        raise GatewayError(
+            "All streaming providers failed."
+        )
+
+    # ========================================================
+    # HEALTH REPORT
+    # ========================================================
+
+    def get_health_report(self) -> dict:
+
         report = {}
-        for name in PROVIDER_PRIORITY:
-            h = self._health[name]
-            report[name] = {
-                "status": h.status,
-                "available": self._providers[name].is_available(),
-                "failures": h.failure_count,
-                "last_success": h.last_success.isoformat() if h.last_success else None,
+
+        for provider_name, health in (
+            self._health.items()
+        ):
+
+            report[provider_name] = {
+
+                "status": health.status,
+
+                "failure_count": (
+                    health.failure_count
+                ),
+
+                "last_failure": (
+                    health.last_failure.isoformat()
+                    if health.last_failure
+                    else None
+                ),
+
+                "cooldown_until": (
+                    health.cooldown_until
+                ),
+
+                "last_success": (
+                    health.last_success.isoformat()
+                    if health.last_success
+                    else None
+                ),
+
+                "last_error_type": (
+                    health.last_error_type
+                ),
             }
+
         return report
 
-    def get_usage_summary(self) -> List[Dict]:
+    # ========================================================
+    # USAGE REPORT
+    # ========================================================
+
+    def get_usage_report(
+        self,
+    ) -> list[dict]:
+
         return [
+
             {
-                "provider": r.provider,
-                "model": r.model,
-                "task": r.task_type,
-                "tokens_in": r.input_tokens,
-                "tokens_out": r.output_tokens,
-                "success": r.success,
-                "time": r.timestamp,
+                "timestamp": (
+                    record.timestamp.isoformat()
+                ),
+
+                "provider": record.provider,
+
+                "model": record.model,
+
+                "task_type": record.task_type,
+
+                "input_tokens": (
+                    record.input_tokens
+                ),
+
+                "output_tokens": (
+                    record.output_tokens
+                ),
+
+                "total_tokens": (
+                    record.total_tokens
+                ),
             }
-            for r in self._usage_log[-20:]
+
+            for record in self._usage_log
         ]
 
 
-# ==========================================
-# SINGLETON INSTANCE
-# ==========================================
+# ============================================================
+# SINGLETON
+# ============================================================
+
 gateway = LLMGateway()
