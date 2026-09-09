@@ -3,6 +3,7 @@ import { API_URL } from "./client";
 export interface ChatStreamOptions {
   message: string;
   conversationId?: string | null;
+  attachmentIds?: string[];
   onToken: (token: string) => void;
   onActivity?: (activity: any) => void;
   onMetadata?: (metadata: any) => void;
@@ -11,13 +12,22 @@ export interface ChatStreamOptions {
 }
 
 export async function streamChat(options: ChatStreamOptions): Promise<void> {
-  const { message, conversationId, onToken, onActivity, onMetadata, onComplete, onError } = options;
+  const {
+    message,
+    conversationId,
+    attachmentIds = [],
+    onToken,
+    onActivity,
+    onMetadata,
+    onComplete,
+    onError,
+  } = options;
 
   try {
     const response = await fetch(`${API_URL}/chat/stream`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message, conversationId }),
+      body: JSON.stringify({ message, conversationId, attachmentIds }),
     });
 
     if (!response.ok || !response.body) {
@@ -31,7 +41,7 @@ export async function streamChat(options: ChatStreamOptions): Promise<void> {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      
+
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split("\n\n");
       buffer = lines.pop() || "";

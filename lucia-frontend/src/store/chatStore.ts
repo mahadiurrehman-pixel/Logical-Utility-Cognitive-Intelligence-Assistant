@@ -1,9 +1,9 @@
 import { create } from "zustand";
-import type { Message, Conversation, ActivityState } from "@/types";
+import type { Message, ActivityState } from "@/types";
 import { streamChat } from "@/lib/api/chat";
 import { createConversation } from "@/lib/api/conversations";
 
-// Global reference to prevent multiple audio overlaps
+// Global reference to prevent audio overlap
 let activeAudio: HTMLAudioElement | null = null;
 
 interface ChatState {
@@ -18,7 +18,7 @@ interface ChatState {
   setActivity: (a: ActivityState) => void;
   setEnableVoice: (v: boolean) => void;
   clearMessages: () => void;
-  sendMessage: (text: string) => Promise<void>;
+  sendMessage: (text: string, attachmentIds?: string[]) => Promise<void>;
 }
 
 export const useChatStore = create<ChatState>((set, get) => ({
@@ -29,10 +29,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   setConversation: (id) => set({ currentConversationId: id, messages: [] }),
   addMessage: (m) => set((s) => ({ messages: [...s.messages, m] })),
-  
+
   setEnableVoice: (enableVoice) => {
     set({ enableVoice });
-    // 🤫 If user turns off voice, instantly stop any currently playing speech
     if (!enableVoice && activeAudio) {
       activeAudio.pause();
       activeAudio = null;
@@ -50,7 +49,6 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const msg = get().messages.find((m) => m.id === id);
     if (!msg) return;
 
-    // ⚡ Prevent Double Triggering: Only run if message state is still "streaming"
     const wasStreaming = msg.streaming;
 
     set((s) => ({
@@ -59,9 +57,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       ),
     }));
 
-    // Trigger TTS only on the initial completion transition
     if (wasStreaming && get().enableVoice) {
-      // Stop previously playing sentence instantly before starting new one
       if (activeAudio) {
         activeAudio.pause();
         activeAudio = null;
@@ -80,20 +76,20 @@ export const useChatStore = create<ChatState>((set, get) => ({
   setActivity: (activity) => set({ activity }),
   clearMessages: () => set({ messages: [] }),
 
-  sendMessage: async (text) => {
+  sendMessage: async (text: string, attachmentIds: string[] = []) => {
     const trimmed = text.trim();
-    if (!trimmed || get().activity.active) return;
+    if (!trimmed && attachmentIds.length === 0) return;
+    if (get().activity.active) return;
 
-    // 🤫 Interrupt any ongoing voice playback when a new prompt is sent
     if (activeAudio) {
       activeAudio.pause();
       activeAudio = null;
     }
 
     let convId = get().currentConversationId;
-    
+
     if (!convId) {
-      const newConv = await createConversation(trimmed.slice(0, 20) + "...");
+      const newConv = await createConversation(trimmed.slice(0, 20) || "New Conversation");
       set({ currentConversationId: newConv.id });
       convId = newConv.id;
     }
@@ -104,7 +100,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     get().addMessage({
       id: userMsgId,
       role: "user",
-      content: trimmed,
+      content: trimmed || `[Attached ${attachmentIds.length} file(s)]`,
       timestamp: new Date().toISOString(),
     });
 
@@ -121,6 +117,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     await streamChat({
       message: trimmed,
       conversationId: convId,
+      attachmentIds,
       onToken: (token) => get().updateStreamingMessage(luciaMsgId, token),
       onActivity: (act) => {
         set({ activity: act });
@@ -130,5 +127,5 @@ export const useChatStore = create<ChatState>((set, get) => ({
       onComplete: () => get().completeStreamingMessage(luciaMsgId),
       onError: () => set({ activity: { active: false } }),
     });
-  }
+  },
 }));

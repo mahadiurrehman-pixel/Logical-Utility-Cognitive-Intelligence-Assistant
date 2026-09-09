@@ -1,5 +1,6 @@
 """
-LUCIA FastAPI Server (Speed Optimized)
+LUCIA FastAPI Server
+High-performance REST & Server-Sent Events (SSE) bridge between Next.js frontend and LUCIA Core.
 """
 import os
 import json
@@ -13,11 +14,13 @@ from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
+# Load .env explicitly
 ENV_PATH = Path(__file__).resolve().parent / ".env"
 load_dotenv(dotenv_path=ENV_PATH, override=True)
 
 from langchain_core.messages import HumanMessage, AIMessage
 
+# Core Imports
 from lucia_core import (
     model,
     summary_model,
@@ -36,9 +39,18 @@ from database import (
     get_global_memories,
 )
 from tool_router import decide_action, execute_tool
-from audio_engine import transcribe_audio, synthesize_audio_async
+from audio_engine_backup import transcribe_audio, synthesize_audio_async
 from llm_gateway import gateway
+from file_processor import (
+    process_uploaded_file, 
+    get_attachment, 
+    delete_attachment, 
+    build_attachment_context
+)
 
+# ==========================================
+# 1. FASTAPI & CORS CONFIGURATION
+# ==========================================
 app = FastAPI(title="LUCIA Core API", version="1.0.0")
 
 app.add_middleware(
@@ -50,14 +62,21 @@ app.add_middleware(
 )
 
 
+# ==========================================
+# 2. REQUEST / RESPONSE SCHEMAS
+# ==========================================
 class ChatRequest(BaseModel):
     message: str
     conversationId: Optional[str] = None
+    attachmentIds: Optional[list[str]] = []
 
 class CreateConversationRequest(BaseModel):
     title: Optional[str] = "New Conversation"
 
 
+# ==========================================
+# 3. CONVERSATION ENDPOINTS
+# ==========================================
 @app.get("/conversations")
 async def list_conversations():
     convs = get_all_conversations()
@@ -102,7 +121,7 @@ async def remove_conversation(conv_id: int):
 
 
 # ==========================================
-# ⚡ LIGHTNING FAST AUDIO ENDPOINTS
+# 4. AUDIO ENDPOINTS
 # ==========================================
 @app.post("/audio/transcribe")
 async def transcribe_mic_audio(file: UploadFile = File(...)):
@@ -116,7 +135,6 @@ async def transcribe_mic_audio(file: UploadFile = File(...)):
 
 @app.get("/audio/synthesize")
 async def synthesize_response_voice(text: str):
-    """⚡ Direct Native Async Edge-TTS (Returns in <250ms!)"""
     try:
         if not text.strip():
             raise HTTPException(status_code=400, detail="Empty text")
@@ -137,6 +155,9 @@ async def synthesize_response_voice(text: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ==========================================
+# 5. STATUS ENDPOINTS
+# ==========================================
 @app.get("/providers/status")
 async def providers_status():
     health = gateway.get_health_report()
@@ -163,7 +184,46 @@ async def system_status():
 
 
 # ==========================================
-# REAL-TIME STREAMING CHAT (SSE)
+# 6. FILE UPLOAD ENDPOINTS
+# ==========================================
+@app.post("/api/files/upload")
+async def upload_file(file: UploadFile = File(...)):
+    """Upload and process a file (PDF, image, audio, doc, csv, xlsx)"""
+    try:
+        file_bytes = await file.read()
+        if not file_bytes:
+            raise HTTPException(status_code=400, detail="Empty file")
+        
+        result = process_uploaded_file(file_bytes, file.filename)
+        
+        if not result["success"]:
+            raise HTTPException(status_code=400, detail=result["message"])
+        
+        return result["attachment"]
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Upload failed: {e}")
+
+
+@app.get("/api/files/{file_id}")
+async def get_file_info(file_id: str):
+    att = get_attachment(file_id)
+    if not att:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    return {k: v for k, v in att.items() if k not in ["base64Image", "storageReference"]}
+
+
+@app.delete("/api/files/{file_id}")
+async def remove_file(file_id: str):
+    success = delete_attachment(file_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    return {"success": True}
+
+
+# ==========================================
+# 7. REAL-TIME STREAMING CHAT (SSE)
 # ==========================================
 @app.post("/chat/stream")
 async def chat_stream(req: ChatRequest):
@@ -210,7 +270,19 @@ async def chat_stream(req: ChatRequest):
             elif r == "assistant":
                 recent_msgs.append(AIMessage(content=c))
 
-        context = build_chat_context(conv_id, recent_msgs, tool_result=tool_result, decision=decision)
+        # 📎 Build attachment context if attachments are uploaded
+        attachment_context = ""
+        if req.attachmentIds:
+            attachment_context = build_attachment_context(req.attachmentIds)
+        
+        # Unified context assembler with attachment injection
+        context = build_chat_context(
+            conv_id, 
+            recent_msgs, 
+            tool_result=tool_result, 
+            decision=decision,
+            attachment_context=attachment_context
+        )
 
         yield f"data: {json.dumps({'activity': {'active': False}, 'conversationId': str(conv_id)})}\n\n"
         full_reply = ""

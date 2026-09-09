@@ -22,8 +22,8 @@ export function MessageList() {
   return (
     <div className="flex-1 overflow-y-auto">
       <div className="max-w-3xl mx-auto pb-32">
-        {messages.map((m) => (
-          <Message key={m.id} message={m} />
+        {messages.map((m, idx) => (
+          <Message key={`msg-${m.id}-${idx}`} message={m} />
         ))}
         {activity.active && (
           <div className="px-6 md:px-8 py-4">

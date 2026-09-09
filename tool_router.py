@@ -1,6 +1,6 @@
 """
 Tool Router: LUCIA ka decision brain
-Optimized with Global Profile memories to auto-fill personalized professional email drafts.
+Strict rules for file creation, fixing, updating, and execution on disk.
 """
 import json
 import re
@@ -21,32 +21,36 @@ from tools import (
     confirm_last_email, cancel_last_email,
 )
 
-# Available tools schema
 TOOLS_SCHEMA = """
-Available tools you can use:
+Available tools:
 
-1. open_website(url) - Opens ANY website (github, netflix, chatgpt, etc.)
-2. open_google(query) - Opens Google homepage or search
+BROWSER:
+1. open_website(url) - Opens ANY website (github, netflix, chatgpt, etc)
+2. open_google(query) - Opens Google or search
 3. open_youtube() - Opens YouTube homepage
-4. search_youtube(query) - Opens YouTube search results list
-5. play_youtube(query) - DIRECTLY PLAYS top video/song on YouTube
-6. web_search(query) - Search web for live information
-7. list_directory(path) - List files in folder
-8. read_file(path) - Read file contents
-9. write_file(path, content) - Create/write a file
-10. create_directory(path) - Create folder
-11. execute_command(command, cwd) - Run local shell command safely
+4. search_youtube(query) - Search YouTube results
+5. play_youtube(query) - DIRECTLY play top video
+6. web_search(query) - Live web info search
 
-GMAIL:
-12. authenticate_gmail() - Connect/test Gmail
-13. fetch_unread_emails(max_results) - Get unread emails
-14. summarize_emails(max_results) - AI summary + urgent detection
-15. read_email(email_id) - Read specific email
-16. search_emails(query, max_results) - Search emails
-17. prepare_email(to, subject, body, cc) - Prepare email and generate a draft review card (DOES NOT SEND)
-18. confirm_last_email() - Send the last prepared email (Call when user says "haan bhej do", "send it", "bhej do")
-19. cancel_last_email() - Cancel/discard the last prepared email (Call when user says "cancel", "cancel karo", "mat bhejo")
-20. draft_message(platform, contact, message) - Prepare WhatsApp/Instagram message draft
+FILESYSTEM (USE THESE to create, update, or fix files on disk):
+7. list_directory(path) - List folder contents
+8. read_file(path) - Read file contents
+9. write_file(path, content) - Create or OVERWRITE/UPDATE a file on disk with full code/content
+10. create_file(path, content) - Create NEW file
+11. edit_file(path, old_text, new_text) - Find & replace in file
+12. delete_file(path, confirm) - Delete file (confirm=True REQUIRED)
+13. create_directory(path) - Create folder
+
+TERMINAL:
+14. execute_command(command, cwd) - Run terminal command (python3, bash, ls, etc)
+
+MESSAGING & GMAIL:
+15. draft_message(platform, contact, message) - WhatsApp/Instagram draft
+16. search_instagram(query) - IG search
+17. search_whatsapp(query) - WhatsApp search
+18. prepare_email(to, subject, body, cc) - Prepare email draft
+19. confirm_last_email() - Send last prepared email
+20. cancel_last_email() - Cancel last prepared email
 """
 
 TOOL_MAP = {
@@ -68,6 +72,9 @@ TOOL_MAP = {
     "draft_message": draft_message,
     "search_instagram": search_instagram,
     "search_whatsapp": search_whatsapp,
+    "list_files": list_directory,
+    "create_folder": create_directory,
+    "open_file": read_file,
     "authenticate_gmail": authenticate_gmail,
     "fetch_unread_emails": fetch_unread_emails,
     "summarize_emails": summarize_emails,
@@ -83,47 +90,61 @@ TOOL_MAP = {
 
 
 def decide_action(user_msg: str, llm) -> dict:
-    """
-    Ask LLM: Is this a tool call or normal chat?
-    Injects global user memories to write customized professional emails.
-    """
     msg_clean = user_msg.lower().strip()
     
-    # ⚡ Fast Path: Map direct voice confirmation keys instantly
     if msg_clean in ["haan bhej do", "send kar do", "bhej do", "bhej de", "send it", "yes send it"]:
         return {"action": "tool", "tool": "confirm_last_email", "params": {}}
     if msg_clean in ["cancel karo", "cancel", "mat bhejo", "discard", "discard it"]:
         return {"action": "tool", "tool": "cancel_last_email", "params": {}}
 
-    # 🧠 Load Global Memories to make the Router intelligent about the User
+    # Load Global Memories
     from database import get_global_memories
     mems = get_global_memories()
     memories_text = "No profile memories found."
     if mems:
         memories_text = "\n".join([f"- {m['memory']}" for m in mems])
 
-    router_prompt = f"""You are LUCIA's action router. Analyze the user's message and decide:
-
-- If user wants conversation ONLY, return: {{"action": "chat"}}
-- If user wants to PERFORM an action, return the appropriate tool call.
+    router_prompt = f"""You are LUCIA's action router. Analyze the user's message and return a JSON tool execution plan.
 
 {TOOLS_SCHEMA}
 
 === USER PROFILE MEMORIES ===
-Use these real details about the user to write highly tailored, professional email bodies. 
-Do NOT write generic placeholders like '[My Name]' or '[My University]' in the email body. Replace them with the actual facts below:
 {memories_text}
 
-EMAIL WRITING & CLARIFICATION RULES:
-- When user asks to write/send a professional email (e.g., job application, leave, project update): Use the USER PROFILE MEMORIES to draft a complete, customized, professional email body.
-- If recipient email is not provided, set "to": "" so the tool triggers clarification questions.
-- If user says "bhej do" / "send it" -> use confirm_last_email.
-- Only respond in valid JSON, nothing else.
+CRITICAL RULES:
+1. CODE FIXING / UPDATING:
+   When user asks to "fix", "update", "modify", "theek karo", "change" a file on disk (e.g. "fix and update /path/to/file.py"):
+   → ALWAYS use `write_file` with the full fixed code inside the `content` parameter!
+   → NEVER respond with {{"action": "chat"}} when a specific file path is requested to be fixed/updated.
+
+2. FILE CREATION:
+   When user says "create file", "write code to file", "script banao":
+   → ALWAYS use `write_file` with the full code.
+
+3. COMPOUND TASKS:
+   If user asks multiple steps (e.g. make folder + write file + run it):
+   → Use `tool_sequence` with a list of tools to execute in order.
+
+4. Return valid JSON only.
 
 Examples:
 
-User: "hr@techcorp.com ko cloud engineer internship ke liye professional email likho"
-{{"action": "tool", "tool": "prepare_email", "params": {{"to": "hr@techcorp.com", "subject": "Application for Cloud Engineer Internship", "body": "Dear Hiring Manager,\\n\\nI hope this email finds you well.\\n\\nI am writing to express my strong interest in the Cloud Engineer Internship position at TechCorp. Currently, I am pursuing my BBIT at Air University, which has equipped me with a strong foundation in managing IT systems and data architectures.\\n\\nAs a Python developer with a deep passion for cloud systems and automation, I am eager to apply my skills to real-world projects at TechCorp. Thank you for your time and consideration.\\n\\nRegards,\\n[Use User Name from memories]"}}}}
+User: "fix and update /home/ded_yeyyy/Desktop/student_manager/calculator.py it fails on 13+32"
+{{
+  "action": "tool",
+  "tool": "write_file",
+  "params": {{
+    "path": "/home/ded_yeyyy/Desktop/student_manager/calculator.py",
+    "content": "#!/usr/bin/env python3\\nimport re, sys\\n\\ndef evaluate(expr):\\n    calc = expr.replace('^', '**')\\n    return eval(calc, {{'__builtins__': {{}}}}, {{}})\\n\\ndef main():\\n    while True:\\n        try:\\n            inp = input('Enter expression: ').strip()\\n            if inp.lower() in ['exit', 'q']: break\\n            print(f'Result: {{evaluate(inp)}}')\\n        except Exception as e:\\n            print(f'Error: {{e}}')\\n\\nif __name__ == '__main__': main()"
+  }}
+}}
+
+User: "Desktop par test.py banao aur print('hi') likho"
+{{
+  "action": "tool",
+  "tool": "write_file",
+  "params": {{"path": "~/Desktop/test.py", "content": "print('hi')"}}
+}}
 
 User message: "{user_msg}"
 
@@ -148,6 +169,49 @@ Respond with valid JSON only:"""
 
 
 def execute_tool(decision: dict) -> dict:
+    """Executes single tool OR multi-step tool sequence"""
+    if decision.get("action") == "tool_sequence" or "tools" in decision:
+        tools_list = decision.get("tools", [])
+        if not tools_list:
+            return {"success": False, "message": "Tool sequence empty tha."}
+        
+        combined_messages = []
+        all_success = True
+        extracted_code = None
+        
+        for idx, step in enumerate(tools_list, 1):
+            t_name = step.get("tool")
+            t_params = step.get("params", {})
+            
+            if t_name not in TOOL_MAP:
+                combined_messages.append(f"Step {idx} ({t_name}): Tool nahi mila.")
+                all_success = False
+                break
+            
+            try:
+                fn = TOOL_MAP[t_name]
+                res = fn(**t_params)
+                
+                status_icon = "✓" if res.get("success") else "✗"
+                combined_messages.append(f"Step {idx} ({t_name}) [{status_icon}]: {res.get('message', '')}")
+                
+                if t_name in ["write_file", "create_file", "generate_code_file"] and "content" in t_params:
+                    extracted_code = t_params["content"]
+                
+                if not res.get("success"):
+                    all_success = False
+                    break
+            except Exception as err:
+                combined_messages.append(f"Step {idx} ({t_name}) [✗]: Error {err}")
+                all_success = False
+                break
+        
+        return {
+            "success": all_success,
+            "message": "\n".join(combined_messages),
+            "data": extracted_code
+        }
+    
     tool_name = decision.get("tool")
     params = decision.get("params", {})
     
@@ -157,6 +221,8 @@ def execute_tool(decision: dict) -> dict:
     try:
         tool_fn = TOOL_MAP[tool_name]
         result = tool_fn(**params)
+        if tool_name in ["write_file", "create_file"] and "content" in params:
+            result["data"] = params["content"]
         return result
     except Exception as e:
         return {"success": False, "message": f"Tool execute nahi hua: {e}"}

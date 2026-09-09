@@ -1,86 +1,191 @@
 """
 LUCIA Audio Engine
-- Native Async Edge-TTS for FastAPI (Ultra-low latency ~200ms)
-- Synchronous Wrapper for Desktop Daemon
-- Google Speech Recognition for accurate Roman Urdu
+------------------
+STT:
+    1. Groq Whisper (PRIMARY)
+    2. faster-whisper local (FALLBACK)
+
+TTS:
+    1. Edge-TTS (PRIMARY)
+    2. Google gTTS (FALLBACK)
+
+Maintains existing interfaces and clean text preprocessing.
 """
+
 import io
 import os
 import re
 import asyncio
 from pathlib import Path
+from typing import Optional
+
 from dotenv import load_dotenv
-import edge_tts
-import speech_recognition as sr
 from pydub import AudioSegment
+import edge_tts
 from gtts import gTTS
+
+# ============================================================
+# ENVIRONMENT
+# ============================================================
 
 ENV_PATH = Path(__file__).resolve().parent / ".env"
 load_dotenv(dotenv_path=ENV_PATH, override=True)
 
-raw_groq_key = os.getenv("GROQ_API_KEY", "").strip().strip('"').strip("'")
+GROQ_API_KEY = (
+    os.getenv("GROQ_API_KEY", "")
+    .strip()
+    .strip('"')
+    .strip("'")
+)
 
-# ==========================================
-# 1. ACCURATE SPEECH-TO-TEXT (Google STT)
-# ==========================================
-recognizer = sr.Recognizer()
+# ============================================================
+# LOCAL FASTER-WHISPER (Lazy Load)
+# ============================================================
 
-def transcribe_audio(audio_bytes):
+_whisper_model = None
+
+
+def get_whisper_model():
+    global _whisper_model
+    if _whisper_model is None:
+        try:
+            from faster_whisper import WhisperModel
+            print("[LUCIA STT] Loading local faster-whisper model...")
+            _whisper_model = WhisperModel(
+                "small",
+                device="cpu",
+                compute_type="int8"
+            )
+            print("[LUCIA STT] Local faster-whisper model loaded.")
+        except Exception as e:
+            print(f"[LUCIA STT] Local Whisper unavailable: {e}")
+            return None
+    return _whisper_model
+
+
+# ============================================================
+# AUDIO CONVERSION
+# ============================================================
+
+def convert_to_wav(audio_bytes: bytes) -> bytes:
+    if not audio_bytes:
+        return b""
+    try:
+        audio = AudioSegment.from_file(io.BytesIO(audio_bytes))
+        audio = audio.set_channels(1)
+        audio = audio.set_frame_rate(16000)
+
+        wav_buffer = io.BytesIO()
+        audio.export(wav_buffer, format="wav")
+        wav_buffer.seek(0)
+        return wav_buffer.read()
+    except Exception as e:
+        print(f"[Audio Conversion Error] {e}")
+        return audio_bytes
+
+
+# ============================================================
+# STT PIPELINE (Groq Primary -> Local Fallback)
+# ============================================================
+
+def transcribe_groq(audio_bytes: bytes) -> str:
+    """Primary STT: Groq Whisper Turbo"""
+    if not GROQ_API_KEY or not audio_bytes:
+        return ""
+    try:
+        from groq import Groq
+        client = Groq(api_key=GROQ_API_KEY)
+        wav_bytes = convert_to_wav(audio_bytes)
+
+        transcription = client.audio.transcriptions.create(
+            file=("command.wav", wav_bytes, "audio/wav"),
+            model="whisper-large-v3-turbo",
+            response_format="text"
+        )
+        return str(transcription).strip()
+    except Exception as e:
+        print(f"[Groq STT Error, switching to local fallback] {e}")
+        return ""
+
+
+def transcribe_local(audio_bytes: bytes) -> str:
+    """Fallback STT: faster-whisper local"""
+    model = get_whisper_model()
+    if model is None or not audio_bytes:
+        return ""
+
+    wav_bytes = convert_to_wav(audio_bytes)
+    if not wav_bytes:
+        return ""
+
+    temp_path = None
+    try:
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            f.write(wav_bytes)
+            temp_path = f.name
+
+        segments, _ = model.transcribe(
+            temp_path,
+            language=None,
+            beam_size=5,
+            vad_filter=True,
+            condition_on_previous_text=False
+        )
+        return " ".join(seg.text.strip() for seg in segments).strip()
+    except Exception as e:
+        print(f"[Local STT Error] {e}")
+        return ""
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
+
+
+def transcribe_audio(audio_bytes: bytes) -> str:
+    """
+    Main STT Entry Point.
+    Priority:
+        1. Groq Whisper (fastest)
+        2. faster-whisper (local offline fallback)
+    """
     if not audio_bytes:
         return ""
 
-    # Primary: Google STT (Perfect for Roman Urdu)
-    try:
-        audio_segment = AudioSegment.from_file(io.BytesIO(audio_bytes))
-        wav_io = io.BytesIO()
-        audio_segment.export(wav_io, format="wav")
-        wav_io.seek(0)
+    text = transcribe_groq(audio_bytes)
+    if text:
+        return text
 
-        with sr.AudioFile(wav_io) as source:
-            audio_data = recognizer.record(source)
-            text = recognizer.recognize_google(audio_data)
-            return text.strip()
-    except Exception as google_err:
-        print(f"[Google STT Warning]: {google_err}")
+    text = transcribe_local(audio_bytes)
+    if text:
+        return text
 
-    # Fallback: Groq Whisper
-    if raw_groq_key:
-        try:
-            from groq import Groq
-            client = Groq(api_key=raw_groq_key)
-            transcription = client.audio.transcriptions.create(
-                file=("command.wav", audio_bytes, "audio/wav"),
-                model="whisper-large-v3-turbo",
-                response_format="text"
-            )
-            return str(transcription).strip()
-        except Exception:
-            pass
-            
     return ""
 
 
-# ==========================================
-# 2. TEXT CLEANING FOR NATURAL SPEECH
-# ==========================================
-def clean_text_for_speech(text):
-    if text is None:
+# ============================================================
+# TEXT CLEANING FOR TTS
+# ============================================================
+
+def clean_text_for_speech(text: str) -> str:
+    if not text:
         return ""
-    if not isinstance(text, str):
-        text = str(text)
 
     # Remove code blocks
-    text = re.sub(r'```[\s\S]*?```', 'Maine code screen par generate kar diya hai.', text)
-    text = re.sub(r'`(.*?)`', r'\1', text)
-    text = re.sub(r'http\S+|www\.\S+', '', text)
+    text = re.sub(r"```.*?```", " Maine code screen par generate kar diya hai. ", text, flags=re.DOTALL)
+    text = re.sub(r"`.*?`", "", text)
 
-    # Remove markdown tables & vertical bars
-    text = re.sub(r'\|[-:\s|]+\|', ' ', text)
+    # Remove URLs
+    text = re.sub(r"https?://\S+", "", text)
+
+    # Remove markdown tables and pipes
+    text = re.sub(r"\|.*?\|", "", text)
     text = text.replace("|", " ").replace("¦", " ").replace("│", " ")
 
-    # Remove box & graph characters
-    ascii_graph_pattern = re.compile(r'[─┌┐└┘├┤┬┴┼═║╔╗╚╝╠╣╦╩╬▲▼►◄█░▓■□▪▫•●★☆✓✔✕✖\\]')
-    text = ascii_graph_pattern.sub(' ', text)
+    # Remove ASCII boxes & symbols
+    text = re.sub(r'[─┌┐└┘├┤┬┴┼═║╔╗╚╝╠╣╦╩╬▲▼►◄█░▓■□▪▫•●★☆✓✔✕✖\\]', ' ', text)
 
     # Remove emojis
     emoji_pattern = re.compile(
@@ -92,29 +197,31 @@ def clean_text_for_speech(text):
         "\u2B50"
         "]+", flags=re.UNICODE
     )
-    text = emoji_pattern.sub(r'', text)
+    text = emoji_pattern.sub("", text)
     text = re.sub(r'[:;=8][\-o\*\']?[\)\]\(\[dDpP/\:\}\{@\|\\]', '', text)
-    text = re.sub(r'[\*\#\_\~\>\+\(\)\[\]\{\}\^\=\<\>]', ' ', text)
 
-    # Pronunciation tuning
-    text = re.sub(r'\bAI\b', 'A.I.', text, flags=re.IGNORECASE)
-    text = re.sub(r'\bAPI\b', 'A.P.I.', text, flags=re.IGNORECASE)
-    text = re.sub(r'\bUI\b', 'U.I.', text, flags=re.IGNORECASE)
-    text = re.sub(r'\bStreamlit\b', 'Stream lit', text, flags=re.IGNORECASE)
+    # Pronunciation Tuning
+    text = re.sub(r"\bAI\b", "A.I.", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bAPI\b", "A.P.I.", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bUI\b", "U.I.", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bStreamlit\b", "Stream lit", text, flags=re.IGNORECASE)
 
-    return re.sub(r'\s+', ' ', text).strip()
+    # Clean markdown characters
+    text = re.sub(r"[*_#>`~]", "", text)
+    text = re.sub(r"\s+", " ", text)
+
+    return text.strip()
 
 
-# ==========================================
-# 3. HIGH-SPEED NEURAL VOICE ENGINE
-# ==========================================
+# ============================================================
+# TTS PIPELINE (Edge-TTS Primary -> gTTS Fallback)
+# ============================================================
+
 PRIMARY_VOICE = "en-IN-NeerjaNeural"
 
+
 async def synthesize_audio_async(text: str) -> bytes:
-    """
-    ⚡ Native Async Audio Synthesis (Designed for FastAPI web server).
-    Generates high quality MP3 in ~200ms!
-    """
+    """Primary TTS: Microsoft Edge Neural TTS"""
     spoken_text = clean_text_for_speech(text)
     if not spoken_text:
         return b""
@@ -123,41 +230,52 @@ async def synthesize_audio_async(text: str) -> bytes:
         communicate = edge_tts.Communicate(
             text=spoken_text,
             voice=PRIMARY_VOICE,
-            rate="+10%",  # ⚡ Crisp & snappy speed
+            rate="+5%",
             pitch="+0Hz"
         )
         buffer = io.BytesIO()
         async for chunk in communicate.stream():
             if chunk["type"] == "audio":
                 buffer.write(chunk["data"])
-
         return buffer.getvalue()
     except Exception as e:
-        print(f"[Async Edge-TTS Error]: {e}")
-        # Fast fallback
-        tts = gTTS(text=spoken_text, lang='en', tld='co.in', slow=False)
-        buf = io.BytesIO()
-        tts.write_to_fp(buf)
-        return buf.getvalue()
+        print(f"[Edge TTS Warning: {e}]")
+        return b""
 
 
-def synthesize_google_tts(text: str) -> bytes:
+def synthesize_gtts(text: str) -> bytes:
+    """Fallback TTS: Google gTTS"""
+    spoken_text = clean_text_for_speech(text)
+    if not spoken_text:
+        return b""
+    try:
+        tts = gTTS(text=spoken_text, lang="en", tld="co.in", slow=False)
+        buffer = io.BytesIO()
+        tts.write_to_fp(buffer)
+        buffer.seek(0)
+        return buffer.read()
+    except Exception as e:
+        print(f"[gTTS Fallback Error: {e}]")
+        return b""
+
+
+def synthesize_google_tts(text: str) -> Optional[bytes]:
     """
-    Synchronous wrapper for Desktop voice daemon.
+    Main TTS Entry Point.
+    Tries Edge-TTS first; on failure, falls back to gTTS.
     """
     spoken_text = clean_text_for_speech(text)
     if not spoken_text:
         return None
 
+    # 1. Edge-TTS Primary
     try:
-        # Run async function cleanly in sync context
-        return asyncio.run(synthesize_audio_async(spoken_text))
+        audio = asyncio.run(synthesize_audio_async(spoken_text))
+        if audio:
+            return audio
     except Exception as e:
-        print(f"[Sync TTS Wrapper Error]: {e}")
-        try:
-            tts = gTTS(text=spoken_text, lang='en', tld='co.in', slow=False)
-            buf = io.BytesIO()
-            tts.write_to_fp(buf)
-            return buf.getvalue()
-        except Exception:
-            return None
+        print(f"[Edge-TTS run error: {e}]")
+
+    # 2. gTTS Fallback
+    audio = synthesize_gtts(spoken_text)
+    return audio if audio else None

@@ -88,10 +88,9 @@ GOAL:
 """
 
 
-def build_chat_context(conversation_id, recent_messages, tool_result=None, decision=None):
+def build_chat_context(conversation_id, recent_messages, tool_result=None, decision=None, attachment_context=""):
     """
-    Builds clean, strict context.
-    Filters out empty messages (0 length) which break Hugging Face tokenizers!
+    Builds clean context with attachment content injection support.
     """
     system_content = get_system_prompt() + "\n\n"
     
@@ -103,17 +102,21 @@ def build_chat_context(conversation_id, recent_messages, tool_result=None, decis
     summary, _ = get_summary(conversation_id)
     if summary:
         system_content += f"=== PREVIOUS CONVERSATION SUMMARY ===\n{summary}\n\n"
+    
+    # 📎 Inject attachment content into system prompt
+    if attachment_context:
+        system_content += attachment_context + "\n"
         
     context = [SystemMessage(content=system_content.strip())]
     
-    # ⚡ Filter out empty messages (Prevents HF 0-chunks bug!)
+    # ... rest of function stays exactly same (message filtering, alignment, tool result injection) ...
     cleaned_messages = []
     for msg in recent_messages:
         if isinstance(msg, SystemMessage):
             continue
         content = msg.content if isinstance(msg.content, str) else str(msg.content or "")
         if not content.strip():
-            continue  # SKIP EMPTY MESSAGES
+            continue
             
         if len(content) > 3000:
             content = content[:2500] + "\n... [content truncated for token limit] ..."
@@ -123,7 +126,6 @@ def build_chat_context(conversation_id, recent_messages, tool_result=None, decis
         elif isinstance(msg, AIMessage):
             cleaned_messages.append(AIMessage(content=content))
 
-    # Ensure alternating sequence starting with HumanMessage
     while cleaned_messages and not isinstance(cleaned_messages[0], HumanMessage):
         cleaned_messages.pop(0)
         
@@ -136,7 +138,6 @@ def build_chat_context(conversation_id, recent_messages, tool_result=None, decis
             
     context.extend(aligned_messages)
     
-    # Inject Tool Result notification
     if tool_result and decision:
         tool_name = decision.get("tool", "tools")
         if tool_name == "web_search":
