@@ -211,7 +211,7 @@ def _process_image(file_path: Path) -> dict:
 def _process_audio(file_path: Path) -> dict:
     """Transcribe using existing audio_engine"""
     try:
-        from audio_engine import transcribe_audio
+        from audio_engine_backup import transcribe_audio
         with open(file_path, "rb") as f:
             audio_bytes = f.read()
         transcript = transcribe_audio(audio_bytes)

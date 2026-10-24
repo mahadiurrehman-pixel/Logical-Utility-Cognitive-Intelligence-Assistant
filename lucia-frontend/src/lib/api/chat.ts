@@ -11,7 +11,77 @@ export interface ChatStreamOptions {
   onError?: (error: Error) => void;
 }
 
-export async function streamChat(options: ChatStreamOptions): Promise<void> {
+function processSSEEvent(
+  event: string,
+  options: {
+    onToken: (token: string) => void;
+    onActivity?: (activity: any) => void;
+    onMetadata?: (metadata: any) => void;
+  }
+) {
+  const {
+    onToken,
+    onActivity,
+    onMetadata,
+  } = options;
+
+  const lines = event.split(/\r?\n/);
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+
+    if (!trimmed.startsWith("data:")) {
+      continue;
+    }
+
+    const rawData = trimmed
+      .slice(5)
+      .trim();
+
+    if (!rawData || rawData === "[DONE]") {
+      continue;
+    }
+
+    try {
+      const data = JSON.parse(rawData);
+
+      if (typeof data === "string") {
+        onToken(data);
+        continue;
+      }
+
+      if (data.token !== undefined && data.token !== null) {
+        onToken(String(data.token));
+      }
+
+      if (data.content !== undefined && data.content !== null) {
+        onToken(String(data.content));
+      }
+
+      if (data.text !== undefined && data.text !== null) {
+        onToken(String(data.text));
+      }
+
+      if (data.activity !== undefined) {
+        onActivity?.(data.activity);
+      }
+
+      if (data.metadata !== undefined) {
+        onMetadata?.(data.metadata);
+      }
+
+    } catch (error) {
+      console.warn(
+        "Skipping invalid SSE payload:",
+        rawData
+      );
+    }
+  }
+}
+
+export async function streamChat(
+  options: ChatStreamOptions
+): Promise<void> {
   const {
     message,
     conversationId,
@@ -23,49 +93,132 @@ export async function streamChat(options: ChatStreamOptions): Promise<void> {
     onError,
   } = options;
 
-  try {
-    const response = await fetch(`${API_URL}/chat/stream`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message, conversationId, attachmentIds }),
-    });
+  let completed = false;
 
-    if (!response.ok || !response.body) {
-      throw new Error(`Server returned status ${response.status}`);
+  const completeOnce = () => {
+    if (completed) return;
+
+    completed = true;
+    onComplete?.();
+  };
+
+  try {
+    const response = await fetch(
+      `${API_URL}/chat/stream`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "text/event-stream",
+          "Cache-Control": "no-cache",
+        },
+        body: JSON.stringify({
+          message,
+          conversationId,
+          attachmentIds,
+        }),
+      }
+    );
+
+    if (!response.ok) {
+      throw new Error(
+        `Server returned status ${response.status}`
+      );
+    }
+
+    if (!response.body) {
+      throw new Error(
+        "Streaming response body is unavailable."
+      );
     }
 
     const reader = response.body.getReader();
-    const decoder = new TextDecoder();
+
+    const decoder = new TextDecoder("utf-8");
+
     let buffer = "";
 
     while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
+      const {
+        done,
+        value,
+      } = await reader.read();
 
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n\n");
-      buffer = lines.pop() || "";
+      if (done) {
+        break;
+      }
 
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (trimmed.startsWith("data:")) {
-          try {
-            const data = JSON.parse(trimmed.slice(5).trim());
-            if (data.token) onToken(data.token);
-            if (data.activity) onActivity?.(data.activity);
-            if (data.metadata) onMetadata?.(data.metadata);
-          } catch (e) {
-            console.error("SSE parse error", e);
-          }
+      if (!value) {
+        continue;
+      }
+
+      buffer += decoder.decode(
+        value,
+        {
+          stream: true,
         }
+      );
+
+      // Handle both LF and CRLF SSE separators.
+      const events = buffer.split(
+        /\r?\n\r?\n/
+      );
+
+      // Keep incomplete event for next chunk.
+      buffer = events.pop() || "";
+
+      for (const event of events) {
+        if (!event.trim()) {
+          continue;
+        }
+
+        processSSEEvent(
+          event,
+          {
+            onToken,
+            onActivity,
+            onMetadata,
+          }
+        );
       }
     }
 
-    onComplete?.();
-  } catch (err: any) {
-    console.error("Chat streaming error:", err);
-    onError?.(err);
-    onToken(`\n\n⚠️ Connection to LUCIA API failed. Is api_server.py running?`);
-    onComplete?.();
+    // Flush decoder's remaining bytes.
+    buffer += decoder.decode();
+
+    // Process final incomplete event, if any.
+    if (buffer.trim()) {
+      processSSEEvent(
+        buffer,
+        {
+          onToken,
+          onActivity,
+          onMetadata,
+        }
+      );
+    }
+
+    completeOnce();
+
+  } catch (err) {
+    const error =
+      err instanceof Error
+        ? err
+        : new Error(
+            String(err)
+          );
+
+    console.error(
+      "Chat streaming error:",
+      error
+    );
+
+    onError?.(error);
+
+    onToken(
+      "\n\n⚠️ Connection to LUCIA API failed. Is api_server.py running?"
+    );
+
+    completeOnce();
   }
 }

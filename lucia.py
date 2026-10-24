@@ -16,7 +16,7 @@ from database import (
     get_all_memories,
     get_global_memories,
 )
-from audio_engine import transcribe_audio, synthesize_google_tts
+from audio_engine_backup import transcribe_audio, synthesize_google_tts
 
 # Core Import
 from lucia_core import (
